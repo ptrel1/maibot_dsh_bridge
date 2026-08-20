@@ -1,4 +1,4 @@
-"""MaiBot Plugin Entry: DSH Bridge with Configurable Persona, Plan B Smart Session & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with Autonomous Non-blocking @Tool, Plan B Session & Safety Guard."""
 
 import asyncio
 import difflib
@@ -223,11 +223,13 @@ class DshBridgePlugin(MaiBotPlugin):
     # 活跃中的任务句柄映射: stream_id -> (dsh_session, asyncio.Task)
     _active_tasks: Dict[str, Tuple[str, asyncio.Task]] = {}
 
+    # 记录每个会话流最近活跃的 session_id（供 @Tool 快速定位目标群/私聊）
+    _last_stream_id: str = ""
+
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
         self.ctx.logger.info(
-            "DSH Bridge 插件已加载，DSH模式: %s，通信: %s，管理员数: %d，提示词池: %d 条",
-            cfg.persona.mode_name,
+            "DSH Bridge 插件已加载 [独立非阻塞模式]，模式: %s，管理员数: %d，提示词池: %d 条",
             cfg.plugin.mode,
             len(cfg.permissions.admin_users),
             len(self._prompt_pool),
@@ -393,7 +395,6 @@ class DshBridgePlugin(MaiBotPlugin):
         """统一执行 DSH 任务核心（支持自定义 Persona 提示词注入）。"""
         cfg = cast(DshBridgeConfig, self.config)
 
-        # 如果配置了自定义 System Prompt，在此处前置拼装
         final_prompt = task
         if cfg.persona.mode_name == "custom" and cfg.persona.custom_system_prompt.strip():
             custom_head = cfg.persona.custom_system_prompt.strip()
@@ -473,7 +474,7 @@ class DshBridgePlugin(MaiBotPlugin):
         return "(未知的通信模式，请检查插件配置)"
 
     # =========================================================================
-    # 1. 注册 Tool 给 Maisaka 大模型
+    # 1. 注册 Tool 给 Maisaka 大模型（完全非阻塞：毫秒级返回，后台异步交付）
     # =========================================================================
 
     @Tool(
@@ -481,7 +482,7 @@ class DshBridgePlugin(MaiBotPlugin):
         description=(
             "DeepSeek Harness (DSH) 重型智能体执行工具。"
             "当用户要求编写代码、修改项目文件、排查服务器日志、执行沙盒测试或分析工程结构时调用此工具。"
-            "【安全约束】：严禁执行 rm -rf /、格式化磁盘、关机等破坏性指令。"
+            "【特点】：该工具会在后台异步启动 DSH 深度推理与执行，并自动向用户汇报进度与交付结果。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -492,21 +493,24 @@ class DshBridgePlugin(MaiBotPlugin):
             ),
         ],
         visibility="visible",
-        timeout_ms=1800000,
     )
     async def handle_tool_dsh(self, task: str = "", **kwargs: Any) -> Dict[str, Any]:
-        """Maisaka 模型调用 DSH 工具回调。"""
+        """Maisaka 模型调用 DSH 工具回调（立即返回确认，后台启动长任务）。"""
         del kwargs
         if not task.strip():
             return {"name": "dsh_execute_task", "content": "任务内容为空"}
 
-        self.ctx.logger.info("Maisaka 模型主动调用 DSH 工具: %s", task)
-        try:
-            result = await self._execute_dsh_task(task, stream_id="tool_invoke")
-            return {"name": "dsh_execute_task", "content": result}
-        except Exception as e:
-            self.ctx.logger.error("DSH Tool 执行异常: %s", e)
-            return {"name": "dsh_execute_task", "content": str(e)}
+        stream_id = self._last_stream_id or "default"
+        self.ctx.logger.info("Maisaka 模型调用 DSH 工具 (非阻塞派发): %s", task)
+
+        # 启动后台异步任务并自动推送到当前会话流，彻底解耦 RPC 管道
+        asyncio.create_task(self._run_and_reply(task, stream_id))
+
+        # 毫秒级直接向大模型返回确认状态，防止 RPC 超时
+        return {
+            "name": "dsh_execute_task",
+            "content": f"任务已成功在后台分派给 DSH 智能体执行。小鲸鱼正在为您持续监视并在完成后自动发送报告，你可以直接告诉用户'任务已在后台启动'。",
+        }
 
     # =========================================================================
     # 2. 消息前置拦截（支持智能会话继承、强制新会话、停止控制与白名单权限）
@@ -529,6 +533,7 @@ class DshBridgePlugin(MaiBotPlugin):
 
         text = (message.get("processed_plain_text") or "").strip()
         stream_id = message.get("session_id", "")
+        self._last_stream_id = stream_id
         prefix = cfg.plugin.trigger_prefix.strip()
 
         # 提取发件人身份
