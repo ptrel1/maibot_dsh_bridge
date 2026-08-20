@@ -1,4 +1,4 @@
-"""MaiBot Plugin Entry: DSH Bridge with Configurable Model, Persona, Non-blocking @Tool & Card Rendering."""
+"""MaiBot Plugin Entry: DSH Bridge with Single-Execution Lock, Plan B Session & Safety Guard."""
 
 import asyncio
 import difflib
@@ -241,10 +241,10 @@ class DshBridgePlugin(MaiBotPlugin):
     # 活跃中的任务句柄映射: stream_id -> (dsh_session, asyncio.Task)
     _active_tasks: Dict[str, Tuple[str, asyncio.Task]] = {}
 
-    # 防重复触发记录: stream_id -> (last_task_text, timestamp)
-    _recent_triggers: Dict[str, Tuple[str, float]] = {}
+    # 全局会话执行锁：stream_id -> (task_text, timestamp)
+    _running_lock_by_stream: Dict[str, Tuple[str, float]] = {}
 
-    # 记录每个会话流最近活跃的 session_id（供 @Tool 快速定位目标群/私聊）
+    # 记录每个会话流最近活跃的 session_id
     _last_stream_id: str = ""
 
     async def on_load(self) -> None:
@@ -265,7 +265,7 @@ class DshBridgePlugin(MaiBotPlugin):
             t.cancel()
         self._active_tasks.clear()
         self._chat_session_history.clear()
-        self._recent_triggers.clear()
+        self._running_lock_by_stream.clear()
         self.ctx.logger.info("DSH Bridge 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -278,20 +278,25 @@ class DshBridgePlugin(MaiBotPlugin):
         admins = [str(u).strip() for u in cfg.permissions.admin_users]
         return str(user_id).strip() in admins
 
-    def _check_and_record_duplicate(self, stream_id: str, task_text: str, dedupe_window_sec: float = 10.0) -> bool:
-        """检测短时间内是否有完全相同的任务重复触发。"""
+    def _acquire_task_lock(self, stream_id: str, task_text: str, lock_window_sec: float = 15.0) -> bool:
+        """获取任务执行锁（若同一会话在 lock_window_sec 内有相同或正在执行的任务则拦截，杜绝双发）。
+        
+        Returns:
+            bool: True 表示成功抢占锁（允许执行）；False 表示已被占用（拦截重复执行）。
+        """
         now = time.time()
         normalized_task = task_text.strip()
-        last_entry = self._recent_triggers.get(stream_id)
 
-        if last_entry:
-            last_task, last_time = last_entry
-            if last_task == normalized_task and (now - last_time) < dedupe_window_sec:
-                self.ctx.logger.info("检测到重复指令 (在 %.1fs 内): '%s'，已自动去重忽略", now - last_time, normalized_task[:40])
-                return True
+        # 检查是否已有正在运行的同一任务
+        if stream_id in self._running_lock_by_stream:
+            last_task, last_time = self._running_lock_by_stream[stream_id]
+            if (now - last_time) < lock_window_sec:
+                self.ctx.logger.info("同一任务正在执行或刚触发 (%.1fs 前): '%s'，拦截二次执行", now - last_time, normalized_task[:30])
+                return False
 
-        self._recent_triggers[stream_id] = (normalized_task, now)
-        return False
+        # 抢占锁
+        self._running_lock_by_stream[stream_id] = (normalized_task, now)
+        return True
 
     def _get_random_prompt_hint(self, task_desc: str, session_action: str = "new") -> str:
         """从当前缓存池随机抽选一句人设提示语，并附带模型与上下文继承说明。"""
@@ -512,53 +517,48 @@ class DshBridgePlugin(MaiBotPlugin):
         return "(未知的通信模式，请检查插件配置)"
 
     # =========================================================================
-    # 1. 注册 Tool 给 Maisaka 大模型（完全非阻塞：毫秒级返回，后台异步交付）
+    # 1. 注册 Tool 给 Maisaka 大模型（仅做被动答疑/查询，不再重复启动执行协程）
     # =========================================================================
 
     @Tool(
         "dsh_execute_task",
         description=(
             "DeepSeek Harness (DSH) 重型智能体执行工具。"
-            "当用户要求编写代码、修改项目文件、排查服务器日志、执行沙盒测试或分析工程结构时调用此工具。"
-            "【特点】：该工具会在后台异步启动 DSH 深度推理与执行，并自动向用户汇报进度与交付结果。"
+            "当用户在对话中要求编写代码、修改项目文件、排查服务器日志、执行沙盒测试或分析工程结构时，优先告知用户后台正在处理。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="task",
                 param_type=ToolParamType.STRING,
-                description="交给 DeepSeek Harness 执行的具体任务描述或代码需求",
+                description="交给 DeepSeek Harness 执行的具体任务描述",
                 required=True,
             ),
         ],
         visibility="visible",
     )
     async def handle_tool_dsh(self, task: str = "", **kwargs: Any) -> Dict[str, Any]:
-        """Maisaka 模型调用 DSH 工具回调（立即返回确认，后台启动长任务）。"""
+        """Maisaka 模型调用 DSH 工具回调（返回状态确认，避免与 HookHandler 重复执行）。"""
         del kwargs
-        if not task.strip():
-            return {"name": "dsh_execute_task", "content": "任务内容为空"}
-
         stream_id = self._last_stream_id or "default"
 
-        # 防重校验
-        if self._check_and_record_duplicate(stream_id, task, dedupe_window_sec=10.0):
+        # 如果 HookHandler 已经拿到锁在跑了，大模型此处直接返回确认
+        if not self._acquire_task_lock(stream_id, task, lock_window_sec=15.0):
             return {
                 "name": "dsh_execute_task",
-                "content": "任务已在后台执行中，无需重复派发。你可以直接告诉用户'任务正在后台处理中'。",
+                "content": "任务已在后台执行中，小鲸鱼正在为您监视并在完成后自动发送报告，你可以直接告诉用户'任务已在后台启动'。",
             }
 
-        self.ctx.logger.info("Maisaka 模型调用 DSH 工具 (非阻塞派发): %s", task)
-
-        # 启动后台异步任务并自动推送到当前会话流
+        # 仅当 HookHandler 漏掉时（如非前缀且非正则识别到的边缘场景），才由 Tool 补充启动
+        self.ctx.logger.info("Maisaka 模型主动触发 DSH 任务派发: %s", task)
         asyncio.create_task(self._run_and_reply(task, stream_id))
 
         return {
             "name": "dsh_execute_task",
-            "content": f"任务已成功在后台分派给 DSH 智能体执行。小鲸鱼正在为您持续监视并在完成后自动发送报告，你可以直接告诉用户'任务已在后台启动'。",
+            "content": "任务已成功在后台分派给 DSH 智能体执行。小鲸鱼正在为您持续监视并在完成后自动发送报告，你可以直接告诉用户'任务已在后台启动'。",
         }
 
     # =========================================================================
-    # 2. 消息前置拦截（泛化自然语言意图感知）
+    # 2. 消息前置拦截（主执行入口：抢占锁后唯一启动）
     # =========================================================================
 
     @HookHandler(
@@ -581,12 +581,11 @@ class DshBridgePlugin(MaiBotPlugin):
         self._last_stream_id = stream_id
         prefix = cfg.plugin.trigger_prefix.strip()
 
-        # 提取发件人身份
         user_info = message.get("message_info", {}).get("user_info", {})
         user_id = str(user_info.get("user_id", "")).strip()
         is_admin = self._is_admin_user(user_id)
 
-        # 0. 优先检测自然语言【停止/中断/取消】请求
+        # 0. 自然语言停止请求
         stop_patterns = [
             r"^(?:停止|取消|中断|别跑了|不要跑了|停下|终止)\s*(?:dsh|任务|执行)?$",
             r"^(?:dsh|deepseek[-_ ]?harness)\s*(?:stop|cancel|停止|取消)$",
@@ -603,7 +602,7 @@ class DshBridgePlugin(MaiBotPlugin):
                 await self.ctx.send.text("（左右张望）当前会话没有正在运行中的 DSH 任务哦~ 🫧", stream_id)
             return
 
-        # 1. 显式【开启全新会话】指令检测 (#dsh new / 重置dsh会话)
+        # 1. 显式重置指令
         reset_patterns = [
             r"^(?:重置|清空|新建|开启新)\s*(?:dsh|会话|上下文)$",
             r"^#dsh\s*(?:new|reset|clean)$",
@@ -616,7 +615,6 @@ class DshBridgePlugin(MaiBotPlugin):
         matched_task: Optional[str] = None
         force_new_session = False
 
-        # 方式 A：显式前缀触发 (#dsh ...)
         if text.startswith(prefix):
             matched_task = text[len(prefix):].strip()
             if matched_task.startswith("new "):
@@ -629,7 +627,6 @@ class DshBridgePlugin(MaiBotPlugin):
                 )
                 return
 
-        # 方式 B：全场景泛化自然语言意图感知
         elif cfg.plugin.enable_natural_language:
             m_dsh = re.search(r"(?:^|\s|，|,|。|！|!)(?:请|帮我|让|使用|调用|通过|用)?(?:dsh|deepseek[-_ ]?harness)(?:去|帮我|来|：|:|\s+)?(.+)$", text, re.IGNORECASE)
             if m_dsh:
@@ -651,18 +648,16 @@ class DshBridgePlugin(MaiBotPlugin):
         if not matched_task:
             return
 
-        # 防重复触发拦截
-        if self._check_and_record_duplicate(stream_id, matched_task, dedupe_window_sec=10.0):
+        # 抢占任务锁（杜绝与模型 @Tool 双重触发）
+        if not self._acquire_task_lock(stream_id, matched_task, lock_window_sec=15.0):
             return
 
-        # 非管理员游客权限开关检查
+        # 权限检查
         if not is_admin and not cfg.permissions.allow_guest_users:
             await self.ctx.send.text("🛡️ 抱歉，当前 DSH 智能体执行功能仅对白名单管理员开放哦~", stream_id)
             return
 
-        # 权限与安全防线评估
         perm_status, reason, final_task = evaluate_task_permission(matched_task, is_admin=is_admin)
-
         if perm_status == "deny":
             self.ctx.logger.warning(f"用户 {user_id} 执行 DSH 任务被拦截: {reason}")
             await self.ctx.send.text(f"🛡️ [权限安全拦截] {reason}", stream_id)
@@ -683,28 +678,19 @@ class DshBridgePlugin(MaiBotPlugin):
         hint_message = self._get_random_prompt_hint(matched_task, session_action=session_action)
         await self.ctx.send.text(hint_message, stream_id)
 
-        # 异步非阻塞执行任务，防止 HookHandler 30s 熔断
+        # 唯一启动后台执行协程
         asyncio.create_task(self._run_and_reply(final_task, stream_id, dsh_session=chosen_session))
 
     async def _run_and_reply(self, task: str, stream_id: str, dsh_session: Optional[str] = None) -> None:
         """异步执行 DSH 任务并回复群聊/私聊。"""
         cfg = cast(DshBridgeConfig, self.config)
-        start_t = time.time()
 
         async def on_progress(progress_text: str, elapsed_sec: int):
             await self.ctx.send.text(progress_text, stream_id)
 
         try:
             result = await self._execute_dsh_task(task, stream_id=stream_id, dsh_session=dsh_session, progress_cb=on_progress)
-            elapsed_sec = int(time.time() - start_t)
-            time_str = f"{elapsed_sec}s" if elapsed_sec < 60 else f"{elapsed_sec // 60}m{elapsed_sec % 60}s"
-            
-            stats = {
-                "model": cfg.model.model,
-                "elapsed": time_str,
-                "mode": cfg.plugin.mode,
-            }
-            await self._deliver_hybrid_result(result, stream_id, stats_meta=stats)
+            await self._deliver_hybrid_result(result, stream_id, stats_meta={"model": cfg.model.model, "mode": cfg.plugin.mode})
         except asyncio.CancelledError:
             self.ctx.logger.info("DSH 任务已被用户主动取消: %s", stream_id)
         except Exception as e:
@@ -738,7 +724,7 @@ class DshBridgePlugin(MaiBotPlugin):
         clean_text = format_markdown_to_clean_text(raw_result)
         stats_line = ""
         if stats_meta:
-            stats_line = f"\n\n──────────────\n📊 耗时: {stats_meta.get('elapsed', '')} · 模型: {stats_meta.get('model', '')} · 沙盒全放行"
+            stats_line = f"\n\n──────────────\n📊 模型: {stats_meta.get('model', '')} · 沙盒全放行"
         await self.ctx.send.text(f"{success_head}\n\n{clean_text}{stats_line}", stream_id)
 
 
