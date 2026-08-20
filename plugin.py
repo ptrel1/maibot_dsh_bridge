@@ -160,7 +160,7 @@ class PluginSectionConfig(PluginConfigBase):
     prompt_refresh_interval: int = Field(default=10, description="调用多少次后自动用大模型生成替换最早的提示语")
     prompt_pool_max_size: int = Field(default=12, description="提示词缓存池最大数量")
     heartbeat_interval_sec: float = Field(default=300.0, description="长任务周期汇报间隔（秒，默认5分钟/300秒）")
-    max_timeout_sec: float = Field(default=1200.0, description="任务最大超时上限（秒，默认20分钟/1200秒）")
+    max_timeout_sec: float = Field(default=1800.0, description="任务最大超时上限（秒，默认30分钟/1800秒）")
     session_match_threshold: float = Field(default=0.45, description="方案B：智能会话匹配阈值（高于此值继承历史会话，否则新建独立会话）")
     session_idle_expire_sec: float = Field(default=1800.0, description="方案B：会话空闲过期时间（秒，默认30分钟未互动自动隔离）")
 
@@ -473,7 +473,7 @@ class DshBridgePlugin(MaiBotPlugin):
             ),
         ],
         visibility="visible",
-        timeout_ms=1200000,
+        timeout_ms=1800000,
     )
     async def handle_tool_dsh(self, task: str = "", **kwargs: Any) -> Dict[str, Any]:
         """Maisaka 模型调用 DSH 工具回调。"""

@@ -12,7 +12,7 @@ block_critical_commands = true
 prompt_refresh_interval = 10
 prompt_pool_max_size = 12
 heartbeat_interval_sec = 300.0
-max_timeout_sec = 1200.0
+max_timeout_sec = 1800.0
 
 [acp]
 dsh_bin = "/home/a1/.npm-global/bin/dsh"
