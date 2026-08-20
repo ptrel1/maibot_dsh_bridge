@@ -298,7 +298,7 @@ class DshBridgePlugin(MaiBotPlugin):
         """Maisaka 模型调用 DSH 工具回调。"""
         del kwargs
         if not task.strip():
-            return {"name": "dsh_execute_task", "content": "任务内容不能为空哦~"}
+            return {"name": "dsh_execute_task", "content": "任务内容为空"}
 
         self.ctx.logger.info("Maisaka 模型主动调用 DSH 工具: %s", task)
         try:
@@ -306,7 +306,7 @@ class DshBridgePlugin(MaiBotPlugin):
             return {"name": "dsh_execute_task", "content": result}
         except Exception as e:
             self.ctx.logger.error("DSH Tool 执行异常: %s", e)
-            return {"name": "dsh_execute_task", "content": f"DSH 执行遇到异常: {e}"}
+            return {"name": "dsh_execute_task", "content": str(e)}
 
     # =========================================================================
     # 2. 消息前置拦截（支持 #dsh 前缀与自然语言意图快速唤起）
