@@ -22,7 +22,7 @@
   },
   "plugin_type": "extension",
   "dependencies": [],
-  "capabilities": ["send.text"],
+  "capabilities": ["send.text", "send.image"],
   "i18n": {
     "default_locale": "zh-CN"
   }
