@@ -1,8 +1,16 @@
+[permissions]
+admin_users = ["3854532368", "1350093676", "1021143806"]
+allow_guest_users = true
+
 [plugin]
 enabled = true
 config_version = "0.1.0"
 mode = "acp"
 trigger_prefix = "#dsh"
+enable_natural_language = true
+block_critical_commands = true
+prompt_refresh_interval = 10
+prompt_pool_max_size = 12
 
 [acp]
 dsh_bin = "/home/a1/.npm-global/bin/dsh"

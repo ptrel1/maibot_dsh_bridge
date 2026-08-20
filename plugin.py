@@ -1,4 +1,4 @@
-"""MaiBot Plugin Entry: DSH Bridge with Dynamic Persona Prompt Pool & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with Role-based Permission, Natural Language & Safety Guard."""
 
 import asyncio
 import json
@@ -16,12 +16,12 @@ from .acp_client import DshAcpClient
 # =========================================================================
 
 DEFAULT_START_PROMPTS: List[str] = [
-    "（尾巴轻轻拍打水面）收到指令啦！正在潜入深海调用 DeepSeek Harness 智能体，主人请稍等一下哦~ 🐋",
+    "（尾巴轻轻拍打水面）收到指令啦！正在潜入深海调用 DeepSeek Harness 智能体，请稍等一下哦~ 🐋",
     "呼……本鲸鱼娘刚刚咬了一大口 Token，现在动力满满！这就叫 DSH 去跑这个任务~ ⚡",
     "（扶正女仆发饰，开始飞速敲击终端）任务已接入 Harness 引擎沙盒，正在全速分析中…… 🐾",
     "嗷！捕捉到任务信号~ 小鲸鱼已经把目标塞进 DSH 智能体流水线啦，咕噜咕噜~ 🌊",
-    "（呆毛敏锐地竖起）发现代码/排查需求！正在召唤 DSH 算力内核，主人喝口水等我一下叭~ ✨",
-    "（轻巧屈膝行礼）遵命，主人！DSH 智能体已被激活，小鲸鱼正在为您监视执行进度~ 🫧",
+    "（呆毛敏锐地竖起）发现代码/排查需求！正在召唤 DSH 算力内核，喝口水等我一下叭~ ✨",
+    "（轻巧屈膝行礼）遵命！DSH 智能体已被激活，小鲸鱼正在为您监视执行进度~ 🫧",
     "收到！这就潜水去启动 Harness 沙盒执行器，很快就好啦~ 🐬",
     "正在让 DSH 全速运转中……可别小看本鲸鱼娘的调度速度哦！🦈",
 ]
@@ -29,28 +29,23 @@ DEFAULT_START_PROMPTS: List[str] = [
 DEFAULT_SUCCESS_HEADS: List[str] = [
     "✨（晃了晃鲸鱼尾巴）DSH 智能体已经顺利把任务搞定啦！交付结果如下：",
     "🎉 呼……任务执行完毕！本鲸鱼娘已经把 DSH 的最终分析整理好啦：",
-    "🐬 报告主人！Harness 沙盒执行完毕，快来看看新鲜出炉的交付内容叭~",
+    "🐬 报告！Harness 沙盒执行完毕，快来看看新鲜出炉的交付内容叭~",
     "✨ 深度思考与执行完成！这是 DSH 智能体为您生成的完整报告：",
 ]
 
-DEFAULT_ERROR_HEADS: List[str] = [
-    "呜哇……（尾巴沮丧地垂下来）DSH 智能体在执行途中遇到了一点异常：",
-    "QAQ 抱歉主人，这次召唤 DSH 好像碰到了小麻烦：",
-    "（呆毛耷拉下来）呜……任务执行时抛出了异常：",
-]
-
 
 # =========================================================================
-# 安全审计与风险评估模块
+# 安全审计与分级权限控制（Role-based Permissions）
 # =========================================================================
 
 class RiskLevel:
-    CRITICAL = "critical"  # 高危破坏（禁止执行）
-    HIGH = "high"          # 高风险操作
-    MEDIUM = "medium"      # 中度风险
-    LOW = "low"            # 安全操作
+    CRITICAL = "critical"  # 高危破坏（管理员也拦截）
+    MUTATION = "mutation"  # 修改/写文件/改配置/删文件（普通用户拦截）
+    SENSITIVE = "sensitive" # 敏感信息探测（密码/密钥/私有文件）
+    SAFE = "safe"          # 安全只读/计算/回答
 
 
+# 1. 绝对高危破坏（所有人拦截）
 CRITICAL_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"rm\s+-rf\s+[/~]"), "递归强制删除根目录或主目录"),
     (re.compile(r"mkfs\."), "格式化文件系统"),
@@ -61,33 +56,81 @@ CRITICAL_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"shutdown|reboot|init\s+0|poweroff"), "关闭或重启服务器系统"),
 ]
 
-HIGH_PATTERNS: List[Tuple[re.Pattern, str]] = [
-    (re.compile(r"DROP\s+DATABASE", re.IGNORECASE), "删除数据库"),
-    (re.compile(r"TRUNCATE\s+TABLE", re.IGNORECASE), "清空数据表"),
-    (re.compile(r"iptables\s+-F"), "清空防火墙规则"),
-    (re.compile(r"pkill\s+-9|killall\s+-9"), "强制批量杀死系统进程"),
+# 2. 状态改动/写入/删除操作（仅管理员放行，普通用户转为只读/分析建议）
+MUTATION_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"(?:修改|改写|重构|覆盖|写入|保存到|编辑|删除|移除|清理|安装|卸载|新增|添加)\s*(?:文件|代码|配置|插件|包|依赖)"), "修改/删除文件与配置"),
+    (re.compile(r"\b(?:write|edit|rm|unlink|delete|truncate|mv|cp|install|remove|patch)\b", re.IGNORECASE), "修改或写入文件系统"),
+    (re.compile(r"(?:apt|pacman|yum|pip|pnpm|npm|yarn)\s+(?:install|remove|uninstall|upgrade)"), "包管理器安装与卸载"),
+    (re.compile(r"git\s+(?:push|commit|checkout|reset|rebase|merge)"), "Git 仓库写入与分支变更"),
+]
+
+# 3. 敏感信息拦截（仅管理员可见，普通用户防泄露）
+SENSITIVE_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"(?:查看|读取|输出|打印|给我|告诉我|查找)\s*(?:密码|密钥|token|api[_-]?key|secret|\.env|凭据|证书)"), "敏感凭据与密钥查询"),
+    (re.compile(r"\b(?:passwd|shadow|\.credentials|\.env|id_rsa|id_ed25519)\b"), "系统敏感文件"),
 ]
 
 
-def evaluate_task_safety(task_text: str) -> Tuple[str, str]:
-    """对用户输入的任务或代码进行快速安全风险评估。"""
+def evaluate_task_permission(task_text: str, is_admin: bool) -> Tuple[str, str, str]:
+    """对用户输入的任务进行权限与风险评估。
+    
+    Returns:
+        (status, reason, transformed_prompt)
+        status: "allow" | "deny" | "sandbox_readonly"
+    """
+    # 1. 绝对高危拦截
     for pattern, reason in CRITICAL_PATTERNS:
         if pattern.search(task_text):
-            return RiskLevel.CRITICAL, reason
-    for pattern, reason in HIGH_PATTERNS:
+            return "deny", f"系统级高危指令拦截：{reason}", task_text
+
+    # 2. 如果是管理员，直接全功能放行
+    if is_admin:
+        return "allow", "管理员全功能放行", task_text
+
+    # 3. 非管理员：拦截敏感凭据探测
+    for pattern, reason in SENSITIVE_PATTERNS:
         if pattern.search(task_text):
-            return RiskLevel.HIGH, reason
-    return RiskLevel.LOW, "安全"
+            return "deny", f"出于数据安全规范，普通权限无法查阅系统敏感凭据与密钥（{reason}）", task_text
+
+    # 4. 非管理员：拦截任何破坏/写入行为，并注入只读沙盒守卫提示
+    for pattern, reason in MUTATION_PATTERNS:
+        if pattern.search(task_text):
+            return "deny", f"普通权限仅支持只读分析、代码阅读、算法解答与咨询，无权直接修改文件或改动系统配置（{reason}）", task_text
+
+    # 5. 普通安全只读任务：附加只读约束 Prompt
+    safe_guard_prefix = (
+        "【安全只读执行约束】当前用户为普通访客权限：\n"
+        "1. 严禁执行任何写入、修改文件（write/edit）、删除或执行破坏性 bash 命令的操作；\n"
+        "2. 严禁在回答中泄露系统中的 API Key、Token、密码或私有密钥（如遇到请打码遮蔽）；\n"
+        "3. 你可以自由进行只读探索（read/grep/glob）、逻辑推演、生成解答或给出修改代码的建议文本供用户参考。\n\n"
+        "用户任务需求如下：\n"
+    )
+    return "allow", "普通用户只读放行", safe_guard_prefix + task_text
 
 
 # =========================================================================
 # 插件配置模型
 # =========================================================================
 
+class PermissionsSectionConfig(PluginConfigBase):
+    __ui_label__ = "权限与白名单管理"
+    __ui_icon__ = "shield"
+    __ui_order__ = 0
+
+    admin_users: List[str] = Field(
+        default=["3854532368", "1350093676", "1021143806"],
+        description="管理员 QQ 号列表（拥有全功能特权，可修改代码与执行命令）",
+    )
+    allow_guest_users: bool = Field(
+        default=True,
+        description="是否允许非管理员使用只读与咨询功能（防泄露、防破坏）",
+    )
+
+
 class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "基础开关"
     __ui_icon__ = "settings"
-    __ui_order__ = 0
+    __ui_order__ = 1
 
     enabled: bool = Field(default=True, description="是否启用 DSH 智能体桥接插件")
     config_version: str = Field(default="0.1.0", description="配置版本")
@@ -95,14 +138,14 @@ class PluginSectionConfig(PluginConfigBase):
     trigger_prefix: str = Field(default="#dsh", description="强制指令前缀，如 #dsh <任务>")
     enable_natural_language: bool = Field(default=True, description="是否启用自然语言意图感知与 @Tool 注册")
     block_critical_commands: bool = Field(default=True, description="是否拦截极端危险指令 (如 rm -rf /)")
-    prompt_refresh_interval: int = Field(default=10, description="调用多少次后自动用大模型生成替换最早的提示语 (默认10次)")
+    prompt_refresh_interval: int = Field(default=10, description="调用多少次后自动用大模型生成替换最早的提示语")
     prompt_pool_max_size: int = Field(default=12, description="提示词缓存池最大数量")
 
 
 class AcpSectionConfig(PluginConfigBase):
     __ui_label__ = "原生 ACP 模式配置"
     __ui_icon__ = "terminal"
-    __ui_order__ = 1
+    __ui_order__ = 2
 
     dsh_bin: str = Field(default="/home/a1/.npm-global/bin/dsh", description="dsh 全局执行文件路径")
     default_cwd: str = Field(default="/main/app/github/deepseek-harness", description="默认工作目录")
@@ -112,13 +155,14 @@ class AcpSectionConfig(PluginConfigBase):
 class PostSectionConfig(PluginConfigBase):
     __ui_label__ = "HTTP POST 模式配置"
     __ui_icon__ = "web"
-    __ui_order__ = 2
+    __ui_order__ = 3
 
     gateway_url: str = Field(default="http://127.0.0.1:3080/api/dsh/v1", description="DSH Post Gateway API 前缀")
     token: str = Field(default="", description="网关访问 Token（如有）")
 
 
 class DshBridgeConfig(PluginConfigBase):
+    permissions: PermissionsSectionConfig = Field(default_factory=PermissionsSectionConfig)
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     acp: AcpSectionConfig = Field(default_factory=AcpSectionConfig)
     post: PostSectionConfig = Field(default_factory=PostSectionConfig)
@@ -139,7 +183,12 @@ class DshBridgePlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
-        self.ctx.logger.info("DSH Bridge 插件已加载，当前模式: %s，提示词池现有: %d 条", cfg.plugin.mode, len(self._prompt_pool))
+        self.ctx.logger.info(
+            "DSH Bridge 插件已加载，模式: %s，管理员数: %d，提示词池: %d 条",
+            cfg.plugin.mode,
+            len(cfg.permissions.admin_users),
+            len(self._prompt_pool),
+        )
 
     async def on_unload(self) -> None:
         if self._acp_client:
@@ -150,6 +199,12 @@ class DshBridgePlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """配置热更新回调。"""
         self.ctx.logger.info(f"DSH Bridge 配置已更新: scope={scope}, version={version}")
+
+    def _is_admin_user(self, user_id: str) -> bool:
+        """判断是否为白名单管理员。"""
+        cfg = cast(DshBridgeConfig, self.config)
+        admins = [str(u).strip() for u in cfg.permissions.admin_users]
+        return str(user_id).strip() in admins
 
     def _get_random_prompt_hint(self, task_desc: str) -> str:
         """从当前缓存池随机抽选一句人设提示语，并推进计数器。"""
@@ -231,13 +286,6 @@ class DshBridgePlugin(MaiBotPlugin):
         """统一执行 DSH 任务核心。"""
         cfg = cast(DshBridgeConfig, self.config)
 
-        # 安全防线拦截（融入 DS娘 人设）
-        if cfg.plugin.block_critical_commands:
-            risk_level, reason = evaluate_task_safety(task)
-            if risk_level == RiskLevel.CRITICAL:
-                self.ctx.logger.warning(f"DSH 指令被安全防线拦截: {reason}")
-                return f"🛡️ 呜哇！主人，这条指令太危险啦（检测到：{reason}）！本鲸鱼娘的防线不能让它摧毁系统哦，已为您安全拦截~"
-
         if cfg.plugin.mode == "acp":
             client = await self._ensure_acp_client()
             if not client:
@@ -282,7 +330,7 @@ class DshBridgePlugin(MaiBotPlugin):
         description=(
             "DeepSeek Harness (DSH) 重型智能体执行工具。"
             "当用户要求编写代码、修改项目文件、排查服务器日志、执行沙盒测试或分析工程结构时调用此工具。"
-            "【安全约束】：禁止执行 rm -rf /、格式化磁盘、关机等破坏性指令。"
+            "【安全约束】：严禁执行 rm -rf /、格式化磁盘、关机等破坏性指令。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -309,7 +357,7 @@ class DshBridgePlugin(MaiBotPlugin):
             return {"name": "dsh_execute_task", "content": str(e)}
 
     # =========================================================================
-    # 2. 消息前置拦截（支持 #dsh 前缀与自然语言意图快速唤起）
+    # 2. 消息前置拦截（支持白名单权限管控、自然语言意图感知）
     # =========================================================================
 
     @HookHandler(
@@ -330,6 +378,11 @@ class DshBridgePlugin(MaiBotPlugin):
         text = (message.get("processed_plain_text") or "").strip()
         stream_id = message.get("session_id", "")
         prefix = cfg.plugin.trigger_prefix.strip()
+
+        # 提取发件人身份
+        user_info = message.get("message_info", {}).get("user_info", {})
+        user_id = str(user_info.get("user_id", "")).strip()
+        is_admin = self._is_admin_user(user_id)
 
         matched_task: Optional[str] = None
 
@@ -361,12 +414,25 @@ class DshBridgePlugin(MaiBotPlugin):
         if not matched_task:
             return
 
+        # 非管理员游客权限开关检查
+        if not is_admin and not cfg.permissions.allow_guest_users:
+            await self.ctx.send.text("🛡️ 抱歉，当前 DSH 智能体执行功能仅对白名单管理员开放哦~", stream_id)
+            return
+
+        # 权限与安全防线评估
+        perm_status, reason, final_task = evaluate_task_permission(matched_task, is_admin=is_admin)
+
+        if perm_status == "deny":
+            self.ctx.logger.warning(f"用户 {user_id} 执行 DSH 任务被拦截: {reason}")
+            await self.ctx.send.text(f"🛡️ [权限安全拦截] {reason}", stream_id)
+            return
+
         # 动态人设提示词（从缓存池抽选并推进计数器）
         hint_message = self._get_random_prompt_hint(matched_task)
         await self.ctx.send.text(hint_message, stream_id)
 
         # 异步非阻塞执行任务，防止 HookHandler 30s 熔断
-        asyncio.create_task(self._run_and_reply(matched_task, stream_id))
+        asyncio.create_task(self._run_and_reply(final_task, stream_id))
 
     async def _run_and_reply(self, task: str, stream_id: str) -> None:
         """异步执行 DSH 任务并回复群聊/私聊。"""
