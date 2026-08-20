@@ -689,22 +689,32 @@ class DshBridgePlugin(MaiBotPlugin):
     async def _run_and_reply(self, task: str, stream_id: str, dsh_session: Optional[str] = None) -> None:
         """异步执行 DSH 任务并回复群聊/私聊。"""
         cfg = cast(DshBridgeConfig, self.config)
+        start_t = time.time()
 
         async def on_progress(progress_text: str, elapsed_sec: int):
             await self.ctx.send.text(progress_text, stream_id)
 
         try:
             result = await self._execute_dsh_task(task, stream_id=stream_id, dsh_session=dsh_session, progress_cb=on_progress)
-            await self._deliver_hybrid_result(result, stream_id, model_name=cfg.model.model)
+            elapsed_sec = int(time.time() - start_t)
+            time_str = f"{elapsed_sec}s" if elapsed_sec < 60 else f"{elapsed_sec // 60}m{elapsed_sec % 60}s"
+            
+            stats = {
+                "model": cfg.model.model,
+                "elapsed": time_str,
+                "mode": cfg.plugin.mode,
+            }
+            await self._deliver_hybrid_result(result, stream_id, stats_meta=stats)
         except asyncio.CancelledError:
             self.ctx.logger.info("DSH 任务已被用户主动取消: %s", stream_id)
         except Exception as e:
             self.ctx.logger.error("DSH 任务执行异常: %s", e, exc_info=True)
             await self.ctx.send.text(str(e), stream_id)
 
-    async def _deliver_hybrid_result(self, raw_result: str, stream_id: str, model_name: str = "") -> None:
+    async def _deliver_hybrid_result(self, raw_result: str, stream_id: str, stats_meta: Optional[Dict[str, Any]] = None) -> None:
         """方案 C 核心：字数 > 200 或包含代码/表格时，直接渲染 GitHub 深色长图发送。"""
         base_head = random.choice(DEFAULT_SUCCESS_HEADS)
+        model_name = (stats_meta or {}).get("model", "")
         model_badge = f" [⚡ {model_name}]" if model_name else ""
         success_head = f"{base_head}{model_badge}"
 
@@ -712,7 +722,11 @@ class DshBridgePlugin(MaiBotPlugin):
 
         if is_long_content:
             try:
-                img_base64 = render_markdown_to_card_image(raw_result, title=f"DeepSeek Harness 交付报告 ({model_name})")
+                img_base64 = render_markdown_to_card_image(
+                    raw_result,
+                    title=f"DeepSeek Harness 交付报告 ({model_name})",
+                    stats_meta=stats_meta,
+                )
                 if img_base64:
                     await self.ctx.send.text(success_head, stream_id)
                     await self.ctx.send.image(img_base64, stream_id)
@@ -722,7 +736,10 @@ class DshBridgePlugin(MaiBotPlugin):
                 self.ctx.logger.warning("卡片图片渲染遇到异常，降级为纯文本排版: %s", render_err)
 
         clean_text = format_markdown_to_clean_text(raw_result)
-        await self.ctx.send.text(f"{success_head}\n\n{clean_text}", stream_id)
+        stats_line = ""
+        if stats_meta:
+            stats_line = f"\n\n──────────────\n📊 耗时: {stats_meta.get('elapsed', '')} · 模型: {stats_meta.get('model', '')} · 沙盒全放行"
+        await self.ctx.send.text(f"{success_head}\n\n{clean_text}{stats_line}", stream_id)
 
 
 def create_plugin() -> MaiBotPlugin:

@@ -1,23 +1,23 @@
-"""High-Performance, Zero-Browser Markdown Card Image Renderer using Pillow."""
+"""High-Performance, Zero-Browser Markdown Card Image Renderer using Pillow with Stats Badges."""
 
 import base64
 import io
 import re
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont
 
 
-def render_markdown_to_card_image(md_text: str, title: str = "DeepSeek Harness 交付报告") -> Optional[str]:
-    """使用 Pillow 原生离线渲染 GitHub/VSCode 深色主题卡片图片，返回 base64 字符串。
-    
-    优势：零浏览器依赖、零网络下载、毫秒级极速渲染、100% 稳定无故障。
-    """
+def render_markdown_to_card_image(
+    md_text: str,
+    title: str = "DeepSeek Harness 交付报告",
+    stats_meta: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """使用 Pillow 原生离线渲染 GitHub/VSCode 深色主题卡片图片，并在底部集成精炼状态指标胶囊。"""
     try:
         width = 860
         padding = 32
         line_spacing = 6
-        
-        # 尝试加载系统高质量字体
+
         font_path = "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"
         bold_font_path = "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc"
         mono_font_path = "/usr/share/fonts/TTF/DejaVuSansMono.ttf"
@@ -29,6 +29,7 @@ def render_markdown_to_card_image(md_text: str, title: str = "DeepSeek Harness �
             f_body = ImageFont.truetype(font_path, 15)
             f_code = ImageFont.truetype(mono_font_path, 14)
             f_small = ImageFont.truetype(font_path, 12)
+            f_badge = ImageFont.truetype(bold_font_path, 12)
         except Exception:
             f_title = ImageFont.load_default()
             f_h1 = f_title
@@ -36,6 +37,7 @@ def render_markdown_to_card_image(md_text: str, title: str = "DeepSeek Harness �
             f_body = f_title
             f_code = f_title
             f_small = f_title
+            f_badge = f_title
 
         # 调色盘 (GitHub Dark 风格)
         c_bg = (13, 17, 23)           # #0d1117
@@ -47,13 +49,13 @@ def render_markdown_to_card_image(md_text: str, title: str = "DeepSeek Harness �
         c_code_bg = (13, 17, 23)      # #0d1117
         c_code_text = (126, 231, 135) # #7ee787
         c_quote_bar = (56, 139, 253)  # #388bfd
+        c_badge_bg = (33, 38, 45)     # #21262d
+        c_badge_border = (56, 139, 253, 120)
 
-        # 文本分行与测量预处理
+        # 文本解析
         raw_lines = md_text.split("\n")
-        render_items: List[Tuple[str, str, Any]] = []  # (type, text, font)
-        
+        render_items: List[Tuple[str, str, Any]] = []
         in_code = False
-        content_w = width - padding * 2
 
         for rline in raw_lines:
             sline = rline.rstrip()
@@ -84,10 +86,7 @@ def render_markdown_to_card_image(md_text: str, title: str = "DeepSeek Harness �
                 render_items.append(("text", sline.strip(), f_body))
 
         # 计算总高度
-        y_cursor = padding + 60  # 头部高度预留
-        dummy_img = Image.new("RGB", (100, 100))
-        draw_calc = ImageDraw.Draw(dummy_img)
-
+        y_cursor = padding + 60
         for itype, itext, ifont in render_items:
             if itype == "spacer":
                 y_cursor += 12
@@ -100,27 +99,28 @@ def render_markdown_to_card_image(md_text: str, title: str = "DeepSeek Harness �
             elif itype == "code_line":
                 y_cursor += 22
             else:
-                # 简单自动换行估算
                 line_len = len(itext)
                 chars_per_line = 48
                 wrapped_rows = max(1, (line_len + chars_per_line - 1) // chars_per_line)
                 y_cursor += wrapped_rows * 24 + line_spacing
 
-        total_h = max(y_cursor + padding + 40, 300)
+        # 底部留给状态徽章的额外空间
+        stats_extra_h = 45 if stats_meta else 10
+        total_h = max(y_cursor + padding + 40 + stats_extra_h, 320)
 
-        # 创建高清画布并绘制
+        # 创建画布
         img = Image.new("RGB", (width, total_h), c_bg)
         draw = ImageDraw.Draw(img)
 
         # 绘制主卡片底色与边框
         draw.rounded_rectangle([padding // 2, padding // 2, width - padding // 2, total_h - padding // 2], radius=12, fill=c_card, outline=c_border, width=1)
 
-        # 绘制头部专属 Logo 与标识
+        # 头部专属 Logo
         draw.text((padding + 8, padding + 8), "🐋 DS娘 x DeepSeek Harness", font=f_title, fill=c_primary)
         draw.text((width - padding - 130, padding + 14), "智能体执行交付", font=f_small, fill=c_muted)
         draw.line([padding + 8, padding + 44, width - padding - 8, padding + 44], fill=c_border, width=1)
 
-        # 逐项渲染内容
+        # 逐项渲染正文
         y = padding + 60
         for itype, itext, ifont in render_items:
             if itype == "spacer":
@@ -152,7 +152,6 @@ def render_markdown_to_card_image(md_text: str, title: str = "DeepSeek Harness �
                 draw.text((padding + 12, y), itext, font=f_body, fill=c_text)
                 y += 24
             else:
-                # 普通段落处理自动分行
                 chars_per_line = 46
                 chunks = [itext[i:i + chars_per_line] for i in range(0, len(itext), chars_per_line)]
                 for chunk in chunks:
@@ -160,13 +159,39 @@ def render_markdown_to_card_image(md_text: str, title: str = "DeepSeek Harness �
                     y += 24
                 y += line_spacing
 
-        # 绘制底部署名
-        draw.text((padding + 8, total_h - padding - 8), "DeepSeek Harness Agent • Powered by MaiBot", font=f_small, fill=c_muted)
+        # =====================================================================
+        # 底部状态栏（设计心理学：渐进式暴露优雅胶囊徽章）
+        # =====================================================================
+        footer_y = total_h - padding - 36
+        if stats_meta:
+            draw.line([padding + 8, footer_y - 8, width - padding - 8, footer_y - 8], fill=c_border, width=1)
+            
+            # 组织徽章列表
+            badges = []
+            if stats_meta.get("model"):
+                badges.append(f"⚡ {stats_meta['model']}")
+            if stats_meta.get("elapsed"):
+                badges.append(f"⏱️ 耗时 {stats_meta['elapsed']}")
+            if stats_meta.get("mode"):
+                badges.append(f"🔌 {stats_meta['mode'].upper()}")
+            badges.append("🛡️ 沙盒全放行")
+            badges.append("🧠 D老师模式")
 
-        # 导出为 Base64 PNG
+            bx = padding + 8
+            for badge_text in badges:
+                bw = len(badge_text) * 11 + 16
+                draw.rounded_rectangle([bx, footer_y, bx + bw, footer_y + 22], radius=11, fill=c_badge_bg, outline=c_border, width=1)
+                draw.text((bx + 8, footer_y + 3), badge_text, font=f_badge, fill=c_primary if "⚡" in badge_text else c_text)
+                bx += bw + 8
+
+            footer_y += 30
+
+        # 底部署名
+        draw.text((padding + 8, total_h - padding + 8), "DeepSeek Harness Agent • Powered by MaiBot", font=f_small, fill=c_muted)
+
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=True)
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
-    except Exception as e:
+    except Exception:
         return None
