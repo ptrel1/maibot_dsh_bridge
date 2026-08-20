@@ -104,6 +104,15 @@ class DshAcpClient:
                 fut.cancel()
         self._pending_requests.clear()
 
+    async def cancel_session(self, session_id: str) -> None:
+        """Send explicit session/cancel to abort in-flight work."""
+        try:
+            if self._running and self._process and self._process.stdin:
+                self.logger.info("Cancelling in-flight DSH session: %s", session_id)
+                await self._send_request("session/cancel", {"sessionId": session_id})
+        except Exception as e:
+            self.logger.warning("Failed to cleanly cancel session %s: %s", session_id, e)
+
     async def create_session(self, cwd: Optional[str] = None) -> str:
         """Create a new session in DSH ACP."""
         if not self._running:
@@ -143,9 +152,15 @@ class DshAcpClient:
                 },
             )
 
-            res = await asyncio.wait_for(prompt_fut, timeout=timeout)
-            stop_reason = res.get("stopReason", "end_turn")
-            self.logger.info("Session %s prompt finished with reason: %s", session_id, stop_reason)
+            try:
+                res = await asyncio.wait_for(prompt_fut, timeout=timeout)
+                stop_reason = res.get("stopReason", "end_turn")
+                self.logger.info("Session %s prompt finished with reason: %s", session_id, stop_reason)
+            except asyncio.TimeoutError:
+                self.logger.warning("Session %s prompt exceeded %s seconds timeout. Cancelling...", session_id, timeout)
+                # 优雅取消正在进行的会话，防止子进程状态污染
+                asyncio.create_task(self.cancel_session(session_id))
+                raise TimeoutError(f"DSH 智能体执行超时（已超过 {int(timeout)} 秒）。已为您自动中止后台任务。")
 
             # Collect accumulated chunks
             chunks = []
@@ -232,7 +247,6 @@ class DshAcpClient:
                 if method == "session/update":
                     sess_id = params.get("sessionId")
                     update = params.get("update", {})
-                    # Chunk delivered (sessionUpdate: "agent_message_chunk")
                     if update.get("sessionUpdate") == "agent_message_chunk" or update.get("type") == "agent_message_chunk":
                         content = update.get("content", {})
                         chunk = content.get("text", "") if isinstance(content, dict) else str(content)
@@ -240,7 +254,6 @@ class DshAcpClient:
                             self._session_listeners[sess_id].put_nowait(chunk)
 
                 elif method == "session/request_permission":
-                    # Auto-approve for non-interactive autonomous runs
                     req_id = data.get("id")
                     if req_id is not None and self._process.stdin:
                         reply = {"jsonrpc": "2.0", "id": req_id, "result": {"outcome": "accepted"}}
