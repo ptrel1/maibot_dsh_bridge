@@ -1,0 +1,29 @@
+{
+  "manifest_version": 2,
+  "id": "com.ptrel.dsh-bridge",
+  "version": "0.1.0",
+  "name": "DSH Bridge (麦麦 x DeepSeek Harness)",
+  "description": "让麦麦拥有 DeepSeek Harness 的重型智能体能力：支持原生 ACP 协议（stdio JSON-RPC）与 HTTP POST 双通信模式，实现代码编写、系统排查与工具调用。",
+  "author": {
+    "name": "ptrel",
+    "url": "https://github.com/ptrel1/maibot_dsh_bridge"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/ptrel1/maibot_dsh_bridge"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "3.99.99"
+  },
+  "sdk": {
+    "min_version": "2.5.1",
+    "max_version": "2.99.99"
+  },
+  "plugin_type": "extension",
+  "dependencies": [],
+  "capabilities": ["send.text"],
+  "i18n": {
+    "default_locale": "zh-CN"
+  }
+}
