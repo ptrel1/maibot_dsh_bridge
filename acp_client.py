@@ -57,6 +57,7 @@ class DshAcpClient:
                     self.model,
                     acp_bin,
                 )
+                # 使用 preexec_fn=os.setsid 建立独立进程组，避免孤儿常驻
                 self._process = await asyncio.create_subprocess_exec(
                     "node",
                     acp_bin,
@@ -66,6 +67,7 @@ class DshAcpClient:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
+                    preexec_fn=os.setsid,
                 )
                 self._running = True
                 self._reader_task = asyncio.create_task(self._read_loop())
@@ -99,8 +101,11 @@ class DshAcpClient:
 
         if self._process:
             try:
-                self._process.terminate()
-                await asyncio.wait_for(self._process.wait(), timeout=3.0)
+                # 杀死整个进程组，彻底根除子进程及孙子进程残留
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(self._process.pid), 9)
+                else:
+                    self._process.kill()
             except Exception:
                 try:
                     self._process.kill()
