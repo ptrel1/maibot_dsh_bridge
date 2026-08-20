@@ -29,6 +29,7 @@ class DshAcpClient:
         self._pending_requests: Dict[int, asyncio.Future] = {}
         self._session_listeners: Dict[str, asyncio.Queue] = {}
         self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
         self._running = False
 
@@ -42,11 +43,9 @@ class DshAcpClient:
                 acp_bin = "/main/app/github/deepseek-harness/packages/examples/acp-demo/lib/bin.js"
                 acp_config = "/main/app/github/deepseek-harness/examples/acp-agent/cordis.yml"
 
-                # 提取环境变量中的 DEEPSEEK_API_KEY
                 env = dict(os.environ)
-                if "DEEPSEEK_API_KEY" not in env:
-                    # 从 .env 或父进程环境变量继承
-                    env["DEEPSEEK_API_KEY"] = os.environ.get("DEEPSEEK_API_KEY", "")
+                if "DEEPSEEK_API_KEY" not in env or not env["DEEPSEEK_API_KEY"]:
+                    env["DEEPSEEK_API_KEY"] = "sk-4008ffef74d94c36a980393c7b856da6"
 
                 self.logger.info("Starting DSH ACP server: node %s --config %s", acp_bin, acp_config)
                 self._process = await asyncio.create_subprocess_exec(
@@ -61,8 +60,9 @@ class DshAcpClient:
                 )
                 self._running = True
                 self._reader_task = asyncio.create_task(self._read_loop())
+                self._stderr_task = asyncio.create_task(self._stderr_loop())
 
-                # Step 1: Handshake initialize (protocolVersion must be integer: 1)
+                # Step 1: Handshake initialize
                 init_res = await self._send_request(
                     "initialize",
                     {
@@ -84,6 +84,9 @@ class DshAcpClient:
         if self._reader_task:
             self._reader_task.cancel()
             self._reader_task = None
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            self._stderr_task = None
 
         if self._process:
             try:
@@ -132,7 +135,6 @@ class DshAcpClient:
         self._session_listeners[session_id] = queue
 
         try:
-            # ACP session/prompt wire schema expects "prompt": [{"type": "text", "text": "..."}]
             prompt_fut = self._send_request(
                 "session/prompt",
                 {
@@ -141,7 +143,6 @@ class DshAcpClient:
                 },
             )
 
-            # Wait for prompt settlement with timeout
             res = await asyncio.wait_for(prompt_fut, timeout=timeout)
             stop_reason = res.get("stopReason", "end_turn")
             self.logger.info("Session %s prompt finished with reason: %s", session_id, stop_reason)
@@ -155,7 +156,7 @@ class DshAcpClient:
 
             final_text = "".join(chunks).strip()
             if not final_text:
-                final_text = "(任务已执行完成，无输出文本)"
+                final_text = "(任务已执行完成，无文本输出)"
             return final_text
         finally:
             self._session_listeners.pop(session_id, None)
@@ -175,6 +176,24 @@ class DshAcpClient:
         await self._process.stdin.drain()
 
         return await fut
+
+    async def _stderr_loop(self) -> None:
+        """Background loop reading stderr diagnostics from DSH ACP process."""
+        if not self._process or not self._process.stderr:
+            return
+        while self._running and self._process:
+            try:
+                line = await self._process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    self.logger.warning("[DSH-ACP-STDERR] %s", text)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error("Error in ACP stderr read loop: %s", e)
+                break
 
     async def _read_loop(self) -> None:
         """Background loop reading stdout from DSH ACP process."""
