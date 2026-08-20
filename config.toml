@@ -11,6 +11,8 @@ enable_natural_language = true
 block_critical_commands = true
 prompt_refresh_interval = 10
 prompt_pool_max_size = 12
+heartbeat_interval_sec = 300.0
+max_timeout_sec = 1200.0
 
 [acp]
 dsh_bin = "/home/a1/.npm-global/bin/dsh"
@@ -19,4 +21,4 @@ timeout = 180.0
 
 [post]
 gateway_url = "http://127.0.0.1:3080/api/dsh/v1"
-token = ""
+token = "Qq13235202993"

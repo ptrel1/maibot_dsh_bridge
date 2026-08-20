@@ -1,10 +1,11 @@
-"""MaiBot Plugin Entry: DSH Bridge with Role-based Permission, Natural Language & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with 20min Long Task, 5min Progressive Summary, Stop Control & Safety Guard."""
 
 import asyncio
 import json
 import random
 import re
-from typing import Any, Dict, List, Optional, Tuple, cast
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
@@ -12,7 +13,7 @@ from .acp_client import DshAcpClient
 
 
 # =========================================================================
-# 初始人设提示句与交付/异常语气种子池（DS娘/鲸鱼娘专属）
+# 初始人设提示句与交付语气种子池（DS娘/鲸鱼娘专属）
 # =========================================================================
 
 DEFAULT_START_PROMPTS: List[str] = [
@@ -45,7 +46,6 @@ class RiskLevel:
     SAFE = "safe"          # 安全只读/计算/回答
 
 
-# 1. 绝对高危破坏（所有人拦截）
 CRITICAL_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"rm\s+-rf\s+[/~]"), "递归强制删除根目录或主目录"),
     (re.compile(r"mkfs\."), "格式化文件系统"),
@@ -56,7 +56,6 @@ CRITICAL_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"shutdown|reboot|init\s+0|poweroff"), "关闭或重启服务器系统"),
 ]
 
-# 2. 状态改动/写入/删除操作（仅管理员放行，普通用户转为只读/分析建议）
 MUTATION_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"(?:修改|改写|重构|覆盖|写入|保存到|编辑|删除|移除|清理|安装|卸载|新增|添加)\s*(?:文件|代码|配置|插件|包|依赖)"), "修改/删除文件与配置"),
     (re.compile(r"\b(?:write|edit|rm|unlink|delete|truncate|mv|cp|install|remove|patch)\b", re.IGNORECASE), "修改或写入文件系统"),
@@ -64,7 +63,6 @@ MUTATION_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"git\s+(?:push|commit|checkout|reset|rebase|merge)"), "Git 仓库写入与分支变更"),
 ]
 
-# 3. 敏感信息拦截（仅管理员可见，普通用户防泄露）
 SENSITIVE_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"(?:查看|读取|输出|打印|给我|告诉我|查找)\s*(?:密码|密钥|token|api[_-]?key|secret|\.env|凭据|证书)"), "敏感凭据与密钥查询"),
     (re.compile(r"\b(?:passwd|shadow|\.credentials|\.env|id_rsa|id_ed25519)\b"), "系统敏感文件"),
@@ -72,32 +70,22 @@ SENSITIVE_PATTERNS: List[Tuple[re.Pattern, str]] = [
 
 
 def evaluate_task_permission(task_text: str, is_admin: bool) -> Tuple[str, str, str]:
-    """对用户输入的任务进行权限与风险评估。
-    
-    Returns:
-        (status, reason, transformed_prompt)
-        status: "allow" | "deny" | "sandbox_readonly"
-    """
-    # 1. 绝对高危拦截
+    """对用户输入的任务进行权限与风险评估。"""
     for pattern, reason in CRITICAL_PATTERNS:
         if pattern.search(task_text):
             return "deny", f"系统级高危指令拦截：{reason}", task_text
 
-    # 2. 如果是管理员，直接全功能放行
     if is_admin:
         return "allow", "管理员全功能放行", task_text
 
-    # 3. 非管理员：拦截敏感凭据探测
     for pattern, reason in SENSITIVE_PATTERNS:
         if pattern.search(task_text):
             return "deny", f"出于数据安全规范，普通权限无法查阅系统敏感凭据与密钥（{reason}）", task_text
 
-    # 4. 非管理员：拦截任何破坏/写入行为，并注入只读沙盒守卫提示
     for pattern, reason in MUTATION_PATTERNS:
         if pattern.search(task_text):
             return "deny", f"普通权限仅支持只读分析、代码阅读、算法解答与咨询，无权直接修改文件或改动系统配置（{reason}）", task_text
 
-    # 5. 普通安全只读任务：附加只读约束 Prompt
     safe_guard_prefix = (
         "【安全只读执行约束】当前用户为普通访客权限：\n"
         "1. 严禁执行任何写入、修改文件（write/edit）、删除或执行破坏性 bash 命令的操作；\n"
@@ -140,6 +128,8 @@ class PluginSectionConfig(PluginConfigBase):
     block_critical_commands: bool = Field(default=True, description="是否拦截极端危险指令 (如 rm -rf /)")
     prompt_refresh_interval: int = Field(default=10, description="调用多少次后自动用大模型生成替换最早的提示语")
     prompt_pool_max_size: int = Field(default=12, description="提示词缓存池最大数量")
+    heartbeat_interval_sec: float = Field(default=300.0, description="长任务周期汇报间隔（秒，默认5分钟/300秒）")
+    max_timeout_sec: float = Field(default=1200.0, description="任务最大超时上限（秒，默认20分钟/1200秒）")
 
 
 class AcpSectionConfig(PluginConfigBase):
@@ -149,7 +139,6 @@ class AcpSectionConfig(PluginConfigBase):
 
     dsh_bin: str = Field(default="/home/a1/.npm-global/bin/dsh", description="dsh 全局执行文件路径")
     default_cwd: str = Field(default="/main/app/github/deepseek-harness", description="默认工作目录")
-    timeout: float = Field(default=180.0, description="任务执行超时时间（秒）")
 
 
 class PostSectionConfig(PluginConfigBase):
@@ -158,7 +147,7 @@ class PostSectionConfig(PluginConfigBase):
     __ui_order__ = 3
 
     gateway_url: str = Field(default="http://127.0.0.1:3080/api/dsh/v1", description="DSH Post Gateway API 前缀")
-    token: str = Field(default="", description="网关访问 Token（如有）")
+    token: str = Field(default="Qq13235202993", description="网关访问 Token")
 
 
 class DshBridgeConfig(PluginConfigBase):
@@ -181,19 +170,26 @@ class DshBridgePlugin(MaiBotPlugin):
     _call_count: int = 0
     _refreshing_prompts: bool = False
 
+    # 活跃中的任务句柄映射: stream_id -> (dsh_session, asyncio.Task)
+    _active_tasks: Dict[str, Tuple[str, asyncio.Task]] = {}
+
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
         self.ctx.logger.info(
-            "DSH Bridge 插件已加载，模式: %s，管理员数: %d，提示词池: %d 条",
+            "DSH Bridge 插件已加载，模式: %s，管理员数: %d，提示词池: %d 条，最大超时: %ds",
             cfg.plugin.mode,
             len(cfg.permissions.admin_users),
             len(self._prompt_pool),
+            int(cfg.plugin.max_timeout_sec),
         )
 
     async def on_unload(self) -> None:
         if self._acp_client:
             await self._acp_client.stop()
             self._acp_client = None
+        for _, (_, t) in self._active_tasks.items():
+            t.cancel()
+        self._active_tasks.clear()
         self.ctx.logger.info("DSH Bridge 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -223,7 +219,7 @@ class DshBridgePlugin(MaiBotPlugin):
             self._call_count = 0
             asyncio.create_task(self._refresh_prompt_pool_via_llm())
 
-        return f"{chosen}\n\n📋 目标任务: {task_desc[:60]}..."
+        return f"{chosen}\n\n📋 目标任务: {task_desc[:60]}...\n💡 提示：如需中途停止，可发送「停止dsh」或「取消任务」"
 
     async def _refresh_prompt_pool_via_llm(self) -> None:
         """后台异步：调用 LLM 生成 3 条全新符合 DS娘 人设的执行等待语并 FIFO 替换最早的句子。"""
@@ -282,8 +278,13 @@ class DshBridgePlugin(MaiBotPlugin):
             await self._acp_client.start()
         return self._acp_client
 
-    async def _execute_dsh_task(self, task: str, stream_id: str = "default") -> str:
-        """统一执行 DSH 任务核心。"""
+    async def _execute_dsh_task(
+        self,
+        task: str,
+        stream_id: str = "default",
+        progress_cb: Optional[Callable[[str, int], Any]] = None,
+    ) -> str:
+        """统一执行 DSH 任务核心（支持 20 分钟长任务与周期心跳总结）。"""
         cfg = cast(DshBridgeConfig, self.config)
 
         if cfg.plugin.mode == "acp":
@@ -296,7 +297,45 @@ class DshBridgePlugin(MaiBotPlugin):
                 dsh_session = await client.create_session()
                 self._sessions[stream_id] = dsh_session
 
-            return await client.prompt(dsh_session, task, timeout=cfg.acp.timeout)
+            # 注册活跃会话
+            current_task = asyncio.current_task()
+            if current_task:
+                self._active_tasks[stream_id] = (dsh_session, current_task)
+
+            # 开启周期性心跳与阶段总结协程
+            heartbeat_interval = max(cfg.plugin.heartbeat_interval_sec, 60.0)
+            max_timeout = max(cfg.plugin.max_timeout_sec, 180.0)
+
+            async def _heartbeat_worker():
+                elapsed = 0
+                while True:
+                    await asyncio.sleep(heartbeat_interval)
+                    elapsed += int(heartbeat_interval)
+                    if progress_cb:
+                        # 尝试从 client 提取当前的中间输出
+                        accumulated = ""
+                        listener = client._session_listeners.get(dsh_session)
+                        if listener and not listener.empty():
+                            # 采样当前收到的最新文本片段
+                            accumulated = f"(最新中间输出: {listener._queue[-1][:120]}...)" if listener._queue else ""
+                        try:
+                            msg = (
+                                f"⌛ [DSH 任务执行中 · 已耗时 {elapsed // 60} 分钟]\n"
+                                f"（晃了晃尾巴）DSH 仍在全力计算与修改中，小鲸鱼持续为您盯梢中哦~ 🫧\n"
+                                f"{accumulated}\n"
+                                f"💡 如需提前结束，可随时输入「停止dsh」"
+                            )
+                            await progress_cb(msg, elapsed)
+                        except Exception as hb_err:
+                            self.ctx.logger.warning("发送心跳进度异常: %s", hb_err)
+
+            hb_task = asyncio.create_task(_heartbeat_worker())
+
+            try:
+                return await client.prompt(dsh_session, task, timeout=max_timeout)
+            finally:
+                hb_task.cancel()
+                self._active_tasks.pop(stream_id, None)
 
         elif cfg.plugin.mode == "post":
             import urllib.request
@@ -319,7 +358,7 @@ class DshBridgePlugin(MaiBotPlugin):
             loop = asyncio.get_running_loop()
 
             def do_post():
-                with urllib.request.urlopen(req, timeout=120) as resp:
+                with urllib.request.urlopen(req, timeout=int(cfg.plugin.max_timeout_sec)) as resp:
                     return json.loads(resp.read().decode("utf-8"))
 
             resp_json = await loop.run_in_executor(None, do_post)
@@ -347,7 +386,7 @@ class DshBridgePlugin(MaiBotPlugin):
             ),
         ],
         visibility="visible",
-        timeout_ms=180000,
+        timeout_ms=1200000,
     )
     async def handle_tool_dsh(self, task: str = "", **kwargs: Any) -> Dict[str, Any]:
         """Maisaka 模型调用 DSH 工具回调。"""
@@ -364,13 +403,13 @@ class DshBridgePlugin(MaiBotPlugin):
             return {"name": "dsh_execute_task", "content": str(e)}
 
     # =========================================================================
-    # 2. 消息前置拦截（支持白名单权限管控、自然语言意图感知）
+    # 2. 消息前置拦截（支持白名单权限、自然语言停止与长任务调度）
     # =========================================================================
 
     @HookHandler(
         "chat.receive.after_process",
         name="dsh_command_handler",
-        description="检测群聊或私聊中的 #dsh 指令及自然语言调用意图",
+        description="检测群聊或私聊中的 #dsh 指令、停止请求及自然语言调用意图",
         mode=HookMode.BLOCKING,
     )
     async def handle_dsh_command(self, **kwargs: Any) -> None:
@@ -390,6 +429,25 @@ class DshBridgePlugin(MaiBotPlugin):
         user_info = message.get("message_info", {}).get("user_info", {})
         user_id = str(user_info.get("user_id", "")).strip()
         is_admin = self._is_admin_user(user_id)
+
+        # -----------------------------------------------------------------
+        # 0. 优先检测自然语言【停止/中断/取消】请求
+        # -----------------------------------------------------------------
+        stop_patterns = [
+            r"^(?:停止|取消|中断|别跑了|不要跑了|停下|终止)\s*(?:dsh|任务|执行)?$",
+            r"^(?:dsh|deepseek[-_ ]?harness)\s*(?:stop|cancel|停止|取消)$",
+            r"^#dsh\s*(?:stop|cancel|停止|取消)$",
+        ]
+        if any(re.search(pat, text, re.IGNORECASE) for pat in stop_patterns):
+            if stream_id in self._active_tasks:
+                dsh_session, task_handle = self._active_tasks.pop(stream_id)
+                task_handle.cancel()
+                if self._acp_client:
+                    asyncio.create_task(self._acp_client.cancel_session(dsh_session))
+                await self.ctx.send.text("🛑（急忙拉闸）收到停止指令！已为您成功中止当前正在执行的 DSH 任务~ 🐾", stream_id)
+            else:
+                await self.ctx.send.text("（左右张望）当前会话没有正在运行中的 DSH 任务哦~ 🫧", stream_id)
+            return
 
         matched_task: Optional[str] = None
 
@@ -443,13 +501,17 @@ class DshBridgePlugin(MaiBotPlugin):
 
     async def _run_and_reply(self, task: str, stream_id: str) -> None:
         """异步执行 DSH 任务并回复群聊/私聊。"""
+        async def on_progress(progress_text: str, elapsed_sec: int):
+            await self.ctx.send.text(progress_text, stream_id)
+
         try:
-            result = await self._execute_dsh_task(task, stream_id=stream_id)
+            result = await self._execute_dsh_task(task, stream_id=stream_id, progress_cb=on_progress)
             success_head = random.choice(DEFAULT_SUCCESS_HEADS)
             await self.ctx.send.text(f"{success_head}\n\n{result}", stream_id)
+        except asyncio.CancelledError:
+            self.ctx.logger.info("DSH 任务已被用户主动取消: %s", stream_id)
         except Exception as e:
             self.ctx.logger.error("DSH 任务执行异常: %s", e, exc_info=True)
-            # 报错信息直接原样输出，不加任何多余包装
             await self.ctx.send.text(str(e), stream_id)
 
 
