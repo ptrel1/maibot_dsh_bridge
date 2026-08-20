@@ -4,7 +4,45 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+def resolve_dsh_home() -> str:
+    """自动动态探测并定位有效的 DSH_HOME 目录，杜绝硬编码。
+    
+    优先级：
+    1. 现有环境变量 DSH_HOME；
+    2. 当前用户 HOME 目录 (~/.dsh)；
+    3. 系统常见用户目录 (/home/*/.dsh) 中含有 settings.yaml 的有效目录；
+    4. /root/.dsh。
+    """
+    if os.environ.get("DSH_HOME"):
+        cand = Path(os.environ["DSH_HOME"])
+        if cand.exists():
+            return str(cand)
+
+    # 检查当前用户 HOME
+    home = Path.home() / ".dsh"
+    if (home / "settings.yaml").exists():
+        return str(home)
+
+    # 若为 root 运行，自动扫描 /home 下各用户的 .dsh 真实有效配置
+    home_parent = Path("/home")
+    if home_parent.exists():
+        try:
+            for udir in home_parent.iterdir():
+                if udir.is_dir():
+                    cand = udir / ".dsh"
+                    if (cand / "settings.yaml").exists():
+                        return str(cand)
+        except Exception:
+            pass
+
+    # 兜底
+    if home.exists():
+        return str(home)
+    return str(Path.home() / ".dsh")
 
 
 class DshAcpClient:
@@ -44,7 +82,9 @@ class DshAcpClient:
                 acp_config = "/main/app/github/deepseek-harness/examples/acp-agent/cordis.yml"
 
                 env = dict(os.environ)
-                env["DSH_HOME"] = "/home/a1/.dsh"
+                # 动态自适应探测 DSH_HOME
+                dsh_home_path = resolve_dsh_home()
+                env["DSH_HOME"] = dsh_home_path
                 env["DSH_PERMISSION_MODE"] = "danger-full-access"
                 env["DSH_MODEL_PROVIDER"] = self.provider
                 env["DSH_MODEL_NAME"] = self.model
@@ -53,12 +93,12 @@ class DshAcpClient:
                     env["DEEPSEEK_API_KEY"] = "sk-4008ffef74d94c36a980393c7b856da6"
 
                 self.logger.info(
-                    "Starting DSH ACP server (%s/%s, danger-full-access): node %s",
+                    "Starting DSH ACP server (%s/%s, DSH_HOME=%s): node %s",
                     self.provider,
                     self.model,
+                    dsh_home_path,
                     acp_bin,
                 )
-                # 使用 preexec_fn=os.setsid 建立独立进程组，避免孤儿常驻
                 self._process = await asyncio.create_subprocess_exec(
                     "node",
                     acp_bin,
@@ -102,7 +142,6 @@ class DshAcpClient:
 
         if self._process:
             try:
-                # 杀死整个进程组，彻底根除子进程及孙子进程残留
                 if hasattr(os, "killpg"):
                     os.killpg(os.getpgid(self._process.pid), 9)
                 else:
@@ -176,7 +215,6 @@ class DshAcpClient:
                 asyncio.create_task(self.cancel_session(session_id))
                 raise TimeoutError(f"DSH 智能体执行超时（已超过 {int(timeout)} 秒）。已为您自动中止后台任务。")
 
-            # Collect accumulated chunks
             chunks = []
             while not queue.empty():
                 item = queue.get_nowait()
@@ -244,7 +282,6 @@ class DshAcpClient:
                 except Exception:
                     continue
 
-                # Handle response
                 if "id" in data and data["id"] in self._pending_requests:
                     req_id = data["id"]
                     fut = self._pending_requests.pop(req_id)
@@ -254,7 +291,6 @@ class DshAcpClient:
                         fut.set_result(data.get("result", {}))
                     continue
 
-                # Handle notification
                 method = data.get("method")
                 params = data.get("params", {})
 
