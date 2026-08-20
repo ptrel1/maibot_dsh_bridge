@@ -1,6 +1,7 @@
-"""MaiBot Plugin Entry: DSH Bridge with 20min Long Task, 5min Progressive Summary, Stop Control & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with Smart Session Matching/Forking (Plan B), 20min Long Task & Safety Guard."""
 
 import asyncio
+import difflib
 import json
 import random
 import re
@@ -33,6 +34,36 @@ DEFAULT_SUCCESS_HEADS: List[str] = [
     "🐬 报告！Harness 沙盒执行完毕，快来看看新鲜出炉的交付内容叭~",
     "✨ 深度思考与执行完成！这是 DSH 智能体为您生成的完整报告：",
 ]
+
+
+# =========================================================================
+# 方案 B：任务历史记录与智能会话匹配/分叉（Session Matching & Router）
+# =========================================================================
+
+class SessionHistoryRecord:
+    """保存每个历史任务的元数据，用于后续相关性匹配。"""
+
+    def __init__(self, session_id: str, task_summary: str, full_prompt: str, created_at: float):
+        self.session_id = session_id
+        self.task_summary = task_summary
+        self.full_prompt = full_prompt
+        self.last_used_at = created_at
+        self.turn_count = 1
+
+
+def calculate_task_similarity(new_task: str, old_task: str) -> float:
+    """基于词重合度与字符序列比对计算任务相似度 (0.0 ~ 1.0)。"""
+    if not new_task or not old_task:
+        return 0.0
+    # 提取关键汉字和英文单词
+    seq_ratio = difflib.SequenceMatcher(None, new_task, old_task).ratio()
+    
+    # 检查关键词共现（如相同的目录路径、文件名、模块名）
+    paths_new = set(re.findall(r"[\w\-\./]+/[^\s,，。]+", new_task))
+    paths_old = set(re.findall(r"[\w\-\./]+/[^\s,，。]+", old_task))
+    path_overlap = len(paths_new & paths_old) / max(len(paths_new | paths_old), 1) if (paths_new or paths_old) else 0.0
+
+    return 0.6 * seq_ratio + 0.4 * path_overlap
 
 
 # =========================================================================
@@ -130,6 +161,8 @@ class PluginSectionConfig(PluginConfigBase):
     prompt_pool_max_size: int = Field(default=12, description="提示词缓存池最大数量")
     heartbeat_interval_sec: float = Field(default=300.0, description="长任务周期汇报间隔（秒，默认5分钟/300秒）")
     max_timeout_sec: float = Field(default=1200.0, description="任务最大超时上限（秒，默认20分钟/1200秒）")
+    session_match_threshold: float = Field(default=0.45, description="方案B：智能会话匹配阈值（高于此值继承历史会话，否则新建独立会话）")
+    session_idle_expire_sec: float = Field(default=1800.0, description="方案B：会话空闲过期时间（秒，默认30分钟未互动自动隔离）")
 
 
 class AcpSectionConfig(PluginConfigBase):
@@ -165,7 +198,10 @@ class DshBridgePlugin(MaiBotPlugin):
     config_model = DshBridgeConfig
 
     _acp_client: Optional[DshAcpClient] = None
-    _sessions: Dict[str, str] = {}
+    
+    # 方案 B 会话池映射: stream_id -> List[SessionHistoryRecord]
+    _chat_session_history: Dict[str, List[SessionHistoryRecord]] = {}
+    
     _prompt_pool: List[str] = list(DEFAULT_START_PROMPTS)
     _call_count: int = 0
     _refreshing_prompts: bool = False
@@ -176,11 +212,10 @@ class DshBridgePlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
         self.ctx.logger.info(
-            "DSH Bridge 插件已加载，模式: %s，管理员数: %d，提示词池: %d 条，最大超时: %ds",
+            "DSH Bridge 插件已加载 [方案B: 智能会话继承模式]，模式: %s，管理员数: %d，提示词池: %d 条",
             cfg.plugin.mode,
             len(cfg.permissions.admin_users),
             len(self._prompt_pool),
-            int(cfg.plugin.max_timeout_sec),
         )
 
     async def on_unload(self) -> None:
@@ -190,6 +225,7 @@ class DshBridgePlugin(MaiBotPlugin):
         for _, (_, t) in self._active_tasks.items():
             t.cancel()
         self._active_tasks.clear()
+        self._chat_session_history.clear()
         self.ctx.logger.info("DSH Bridge 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -202,8 +238,8 @@ class DshBridgePlugin(MaiBotPlugin):
         admins = [str(u).strip() for u in cfg.permissions.admin_users]
         return str(user_id).strip() in admins
 
-    def _get_random_prompt_hint(self, task_desc: str) -> str:
-        """从当前缓存池随机抽选一句人设提示语，并推进计数器。"""
+    def _get_random_prompt_hint(self, task_desc: str, session_action: str = "new") -> str:
+        """从当前缓存池随机抽选一句人设提示语，并附带上下文继承说明。"""
         cfg = cast(DshBridgeConfig, self.config)
         if not self._prompt_pool:
             self._prompt_pool = list(DEFAULT_START_PROMPTS)
@@ -214,12 +250,68 @@ class DshBridgePlugin(MaiBotPlugin):
         self._call_count += 1
         threshold = max(cfg.plugin.prompt_refresh_interval, 3)
 
-        # 达到调用阈值触发异步更新
         if self._call_count >= threshold and not self._refreshing_prompts:
             self._call_count = 0
             asyncio.create_task(self._refresh_prompt_pool_via_llm())
 
-        return f"{chosen}\n\n📋 目标任务: {task_desc[:60]}...\n💡 提示：如需中途停止，可发送「停止dsh」或「取消任务」"
+        action_hint = "🔗 [继承历史会话上下文]" if session_action == "resume" else "✨ [已为您开启独立干净会话]"
+        return f"{chosen}\n\n📋 目标: {task_desc[:60]}...\n{action_hint}\n💡 提示：如需中途停止可发「停止dsh」，如需强制新会话可发「#dsh new」"
+
+    async def _resolve_smart_session(self, stream_id: str, task: str) -> Tuple[str, str]:
+        """方案 B 核心裁决器：计算相似度并决定继承历史 Session 或创建新独立 Session。"""
+        client = await self._ensure_acp_client()
+        cfg = cast(DshBridgeConfig, self.config)
+        history_list = self._chat_session_history.setdefault(stream_id, [])
+        now = time.time()
+
+        # 1. 显式上下文代词与追问判断（"继续"、"刚才的"、"接着改"、"再优化一下"）
+        continuation_patterns = [r"^(?:继续|接着|刚才|上一条|再改|在这个基础上|顺便把)", r"(?:刚才|之前|上面).*(?:修改|代码|文件|结果)"]
+        is_explicit_continue = any(re.search(pat, task) for pat in continuation_patterns)
+
+        if is_explicit_continue and history_list:
+            # 命中显式追问：直接继承最新的一个历史会话
+            latest_record = history_list[-1]
+            latest_record.last_used_at = now
+            latest_record.turn_count += 1
+            self.ctx.logger.info("命中显式追问意图，继承最近 Session: %s", latest_record.session_id)
+            return latest_record.session_id, "resume"
+
+        # 2. 遍历历史会话计算语义与路径相关度
+        best_record: Optional[SessionHistoryRecord] = None
+        best_score = 0.0
+        expire_sec = cfg.plugin.session_idle_expire_sec
+
+        for rec in reversed(history_list):
+            if (now - rec.last_used_at) > expire_sec:
+                continue
+            score = calculate_task_similarity(task, rec.task_summary)
+            if score > best_score:
+                best_score = score
+                best_record = rec
+
+        threshold = cfg.plugin.session_match_threshold
+        if best_record and best_score >= threshold:
+            best_record.last_used_at = now
+            best_record.turn_count += 1
+            best_record.task_summary += f" -> {task[:30]}"
+            self.ctx.logger.info("智能命中历史任务 (相似度 %.2f >= %.2f)，继承 Session: %s", best_score, threshold, best_record.session_id)
+            return best_record.session_id, "resume"
+
+        # 3. 相似度不足或全新话题：创建独立 Session 隔离环境
+        new_session_id = await client.create_session()
+        new_record = SessionHistoryRecord(
+            session_id=new_session_id,
+            task_summary=task[:80],
+            full_prompt=task,
+            created_at=now,
+        )
+        history_list.append(new_record)
+        # 最多保留最近 15 个会话索引
+        if len(history_list) > 15:
+            history_list.pop(0)
+
+        self.ctx.logger.info("开启全新独立 Session: %s (最高相似度 %.2f < %.2f)", new_session_id, best_score, threshold)
+        return new_session_id, "new"
 
     async def _refresh_prompt_pool_via_llm(self) -> None:
         """后台异步：调用 LLM 生成 3 条全新符合 DS娘 人设的执行等待语并 FIFO 替换最早的句子。"""
@@ -282,9 +374,10 @@ class DshBridgePlugin(MaiBotPlugin):
         self,
         task: str,
         stream_id: str = "default",
+        dsh_session: Optional[str] = None,
         progress_cb: Optional[Callable[[str, int], Any]] = None,
     ) -> str:
-        """统一执行 DSH 任务核心（支持 20 分钟长任务与周期心跳总结）。"""
+        """统一执行 DSH 任务核心（方案B：支持动态会话路由、20分钟长任务与周期心跳总结）。"""
         cfg = cast(DshBridgeConfig, self.config)
 
         if cfg.plugin.mode == "acp":
@@ -292,17 +385,13 @@ class DshBridgePlugin(MaiBotPlugin):
             if not client:
                 raise RuntimeError("ACP 客户端初始化失败")
 
-            dsh_session = self._sessions.get(stream_id)
             if not dsh_session:
-                dsh_session = await client.create_session()
-                self._sessions[stream_id] = dsh_session
+                dsh_session, _ = await self._resolve_smart_session(stream_id, task)
 
-            # 注册活跃会话
             current_task = asyncio.current_task()
             if current_task:
                 self._active_tasks[stream_id] = (dsh_session, current_task)
 
-            # 开启周期性心跳与阶段总结协程
             heartbeat_interval = max(cfg.plugin.heartbeat_interval_sec, 60.0)
             max_timeout = max(cfg.plugin.max_timeout_sec, 180.0)
 
@@ -312,11 +401,9 @@ class DshBridgePlugin(MaiBotPlugin):
                     await asyncio.sleep(heartbeat_interval)
                     elapsed += int(heartbeat_interval)
                     if progress_cb:
-                        # 尝试从 client 提取当前的中间输出
                         accumulated = ""
                         listener = client._session_listeners.get(dsh_session)
                         if listener and not listener.empty():
-                            # 采样当前收到的最新文本片段
                             accumulated = f"(最新中间输出: {listener._queue[-1][:120]}...)" if listener._queue else ""
                         try:
                             msg = (
@@ -403,7 +490,7 @@ class DshBridgePlugin(MaiBotPlugin):
             return {"name": "dsh_execute_task", "content": str(e)}
 
     # =========================================================================
-    # 2. 消息前置拦截（支持白名单权限、自然语言停止与长任务调度）
+    # 2. 消息前置拦截（支持智能会话继承、强制新会话、停止控制与白名单权限）
     # =========================================================================
 
     @HookHandler(
@@ -449,14 +536,30 @@ class DshBridgePlugin(MaiBotPlugin):
                 await self.ctx.send.text("（左右张望）当前会话没有正在运行中的 DSH 任务哦~ 🫧", stream_id)
             return
 
+        # -----------------------------------------------------------------
+        # 1. 显式【开启全新会话】指令检测 (#dsh new / 重置dsh会话)
+        # -----------------------------------------------------------------
+        reset_patterns = [
+            r"^(?:重置|清空|新建|开启新)\s*(?:dsh|会话|上下文)$",
+            r"^#dsh\s*(?:new|reset|clean)$",
+        ]
+        if any(re.search(pat, text, re.IGNORECASE) for pat in reset_patterns):
+            self._chat_session_history.pop(stream_id, None)
+            await self.ctx.send.text("🧹（打扫战场）已为您重置 DSH 会话记忆！下一次任务将从全新干净的沙盒开始~ ✨", stream_id)
+            return
+
         matched_task: Optional[str] = None
+        force_new_session = False
 
         # 方式 A：显式前缀触发 (#dsh ...)
         if text.startswith(prefix):
             matched_task = text[len(prefix):].strip()
+            if matched_task.startswith("new "):
+                force_new_session = True
+                matched_task = matched_task[4:].strip()
             if not matched_task:
                 await self.ctx.send.text(
-                    f"🐾 DS娘提醒您，指令格式是这样哒：\n{prefix} <你的任务描述/代码需求/排查目标>",
+                    f"🐾 DS娘提醒您，指令格式是这样哒：\n{prefix} <你的任务描述/代码需求/排查目标>\n💡 提示：输入 `{prefix} new <任务>` 可强制开新会话",
                     stream_id,
                 )
                 return
@@ -492,20 +595,32 @@ class DshBridgePlugin(MaiBotPlugin):
             await self.ctx.send.text(f"🛡️ [权限安全拦截] {reason}", stream_id)
             return
 
-        # 动态人设提示词（从缓存池抽选并推进计数器）
-        hint_message = self._get_random_prompt_hint(matched_task)
+        # 方案 B 核心：智能裁决会话是继承历史还是开启新会话
+        if force_new_session:
+            client = await self._ensure_acp_client()
+            chosen_session = await client.create_session()
+            session_action = "new"
+            # 记入历史索引
+            self._chat_session_history.setdefault(stream_id, []).append(
+                SessionHistoryRecord(chosen_session, matched_task[:80], matched_task, time.time())
+            )
+        else:
+            chosen_session, session_action = await self._resolve_smart_session(stream_id, matched_task)
+
+        # 动态人设提示词（从缓存池抽选并告知用户是否继承了上下文）
+        hint_message = self._get_random_prompt_hint(matched_task, session_action=session_action)
         await self.ctx.send.text(hint_message, stream_id)
 
         # 异步非阻塞执行任务，防止 HookHandler 30s 熔断
-        asyncio.create_task(self._run_and_reply(final_task, stream_id))
+        asyncio.create_task(self._run_and_reply(final_task, stream_id, dsh_session=chosen_session))
 
-    async def _run_and_reply(self, task: str, stream_id: str) -> None:
+    async def _run_and_reply(self, task: str, stream_id: str, dsh_session: Optional[str] = None) -> None:
         """异步执行 DSH 任务并回复群聊/私聊。"""
         async def on_progress(progress_text: str, elapsed_sec: int):
             await self.ctx.send.text(progress_text, stream_id)
 
         try:
-            result = await self._execute_dsh_task(task, stream_id=stream_id, progress_cb=on_progress)
+            result = await self._execute_dsh_task(task, stream_id=stream_id, dsh_session=dsh_session, progress_cb=on_progress)
             success_head = random.choice(DEFAULT_SUCCESS_HEADS)
             await self.ctx.send.text(f"{success_head}\n\n{result}", stream_id)
         except asyncio.CancelledError:
