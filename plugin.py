@@ -1,11 +1,13 @@
-"""MaiBot Plugin Entry: DSH Bridge with In-flight Progress Reporting, Plan B Session & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with Durable Session Persistence & Auto-Recovery."""
 
 import asyncio
 import difflib
 import json
+import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
@@ -39,18 +41,37 @@ DEFAULT_SUCCESS_HEADS: List[str] = [
 
 
 # =========================================================================
-# 方案 B：任务历史记录与智能会话匹配/分叉（Session Matching & Router）
+# 方案 B：任务历史记录与智能会话匹配/分叉（带磁盘持久化存储）
 # =========================================================================
 
 class SessionHistoryRecord:
     """保存每个历史任务的元数据，用于后续相关性匹配。"""
 
-    def __init__(self, session_id: str, task_summary: str, full_prompt: str, created_at: float):
+    def __init__(self, session_id: str, task_summary: str, full_prompt: str, created_at: float, turn_count: int = 1):
         self.session_id = session_id
         self.task_summary = task_summary
         self.full_prompt = full_prompt
         self.last_used_at = created_at
-        self.turn_count = 1
+        self.turn_count = turn_count
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "task_summary": self.task_summary,
+            "full_prompt": self.full_prompt,
+            "last_used_at": self.last_used_at,
+            "turn_count": self.turn_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SessionHistoryRecord":
+        return cls(
+            session_id=data["session_id"],
+            task_summary=data["task_summary"],
+            full_prompt=data.get("full_prompt", ""),
+            created_at=data["last_used_at"],
+            turn_count=data.get("turn_count", 1),
+        )
 
 
 def calculate_task_similarity(new_task: str, old_task: str) -> float:
@@ -244,25 +265,62 @@ class DshBridgePlugin(MaiBotPlugin):
     # 记录每个会话流最近活跃的 session_id
     _last_stream_id: str = ""
 
+    def _get_storage_file_path(self) -> Path:
+        """获取会话历史持久化文件路径。"""
+        pkg_dir = Path(__file__).resolve().parent
+        data_dir = pkg_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir / "sessions.json"
+
+    def _load_persisted_sessions(self) -> None:
+        """麦麦启动或热重载时，从磁盘恢复之前的会话索引。"""
+        try:
+            sfile = self._get_storage_file_path()
+            if sfile.exists():
+                with open(sfile, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for stream_id, rec_list in data.items():
+                        if isinstance(rec_list, list):
+                            self._chat_session_history[stream_id] = [
+                                SessionHistoryRecord.from_dict(r) for r in rec_list if isinstance(r, dict)
+                            ]
+                self.ctx.logger.info("已成功从磁盘恢复 %d 个会话流的 DSH 历史记忆", len(self._chat_session_history))
+        except Exception as e:
+            self.ctx.logger.warning("恢复持久化会话异常: %s", e)
+
+    def _save_persisted_sessions(self) -> None:
+        """保存当前会话索引至磁盘。"""
+        try:
+            sfile = self._get_storage_file_path()
+            serializable = {}
+            for stream_id, recs in self._chat_session_history.items():
+                serializable[stream_id] = [r.to_dict() for r in recs]
+            with open(sfile, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.ctx.logger.warning("持久化会话索引异常: %s", e)
+
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
+        self._load_persisted_sessions()
         self.ctx.logger.info(
-            "DSH Bridge 插件已加载，模型: %s/%s，模式: %s，提示词池: %d 条",
+            "DSH Bridge 插件已加载，模型: %s/%s，模式: %s，已恢复会话数: %d",
             cfg.model.provider,
             cfg.model.model,
             cfg.plugin.mode,
-            len(self._prompt_pool),
+            len(self._chat_session_history),
         )
 
     async def on_unload(self) -> None:
+        self._save_persisted_sessions()
         if self._acp_client:
             await self._acp_client.stop()
             self._acp_client = None
         for _, (_, _, _, t) in self._active_tasks.items():
             t.cancel()
         self._active_tasks.clear()
-        self._chat_session_history.clear()
-        self.ctx.logger.info("DSH Bridge 插件已卸载")
+        self.ctx.logger.info("DSH Bridge 插件已卸载并保存会话记忆")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """配置热更新回调。"""
@@ -275,7 +333,7 @@ class DshBridgePlugin(MaiBotPlugin):
         return str(user_id).strip() in admins
 
     def _get_active_task_status_message(self, stream_id: str) -> Optional[str]:
-        """方案 1 核心：当会话繁忙时，提取当前正在执行的任务状态、耗时与中间输出，生成贴心回复。"""
+        """当会话繁忙时，提取当前正在执行的任务状态、耗时与中间输出。"""
         if stream_id not in self._active_tasks:
             return None
 
@@ -283,7 +341,6 @@ class DshBridgePlugin(MaiBotPlugin):
         elapsed = int(time.time() - start_time)
         time_str = f"{elapsed} 秒" if elapsed < 60 else f"{elapsed // 60} 分 {elapsed % 60} 秒"
 
-        # 尝试提取已收到的中间片段
         accumulated = ""
         if self._acp_client:
             listener = self._acp_client._session_listeners.get(dsh_session)
@@ -323,7 +380,7 @@ class DshBridgePlugin(MaiBotPlugin):
         return f"{chosen}\n\n📋 目标: {task_desc[:60]}...\n{model_info} | {action_hint}\n💡 提示：如需中途停止可发「停止dsh」，如需强制新会话可发「#dsh new」"
 
     async def _resolve_smart_session(self, stream_id: str, task: str) -> Tuple[str, str]:
-        """方案 B 核心裁决器：计算相似度并决定继承历史 Session 或创建新独立 Session。"""
+        """方案 B 核心裁决器：计算相似度并决定继承历史 Session 或创建新独立 Session（带持久化）。"""
         client = await self._ensure_acp_client()
         cfg = cast(DshBridgeConfig, self.config)
         history_list = self._chat_session_history.setdefault(stream_id, [])
@@ -337,6 +394,7 @@ class DshBridgePlugin(MaiBotPlugin):
             latest_record.last_used_at = now
             latest_record.turn_count += 1
             self.ctx.logger.info("命中显式追问意图，继承最近 Session: %s", latest_record.session_id)
+            self._save_persisted_sessions()
             return latest_record.session_id, "resume"
 
         best_record: Optional[SessionHistoryRecord] = None
@@ -357,6 +415,7 @@ class DshBridgePlugin(MaiBotPlugin):
             best_record.turn_count += 1
             best_record.task_summary += f" -> {task[:30]}"
             self.ctx.logger.info("智能命中历史任务 (相似度 %.2f >= %.2f)，继承 Session: %s", best_score, threshold, best_record.session_id)
+            self._save_persisted_sessions()
             return best_record.session_id, "resume"
 
         new_session_id = await client.create_session()
@@ -370,6 +429,7 @@ class DshBridgePlugin(MaiBotPlugin):
         if len(history_list) > 15:
             history_list.pop(0)
 
+        self._save_persisted_sessions()
         self.ctx.logger.info("开启全新独立 Session: %s (最高相似度 %.2f < %.2f)", new_session_id, best_score, threshold)
         return new_session_id, "new"
 
@@ -545,7 +605,6 @@ class DshBridgePlugin(MaiBotPlugin):
         del kwargs
         stream_id = self._last_stream_id or "default"
 
-        # 方案 1：检查是否有正在执行的任务
         if stream_id in self._active_tasks:
             status_msg = self._get_active_task_status_message(stream_id)
             return {
@@ -613,6 +672,7 @@ class DshBridgePlugin(MaiBotPlugin):
         ]
         if any(re.search(pat, text, re.IGNORECASE) for pat in reset_patterns):
             self._chat_session_history.pop(stream_id, None)
+            self._save_persisted_sessions()
             await self.ctx.send.text("🧹（打扫战场）已为您重置 DSH 会话记忆！下一次任务将从全新干净的沙盒开始~ ✨", stream_id)
             return
 
@@ -678,6 +738,7 @@ class DshBridgePlugin(MaiBotPlugin):
             self._chat_session_history.setdefault(stream_id, []).append(
                 SessionHistoryRecord(chosen_session, matched_task[:80], matched_task, time.time())
             )
+            self._save_persisted_sessions()
         else:
             chosen_session, session_action = await self._resolve_smart_session(stream_id, matched_task)
 
@@ -702,7 +763,6 @@ class DshBridgePlugin(MaiBotPlugin):
             self.ctx.logger.info("DSH 任务已被用户主动取消: %s", stream_id)
         except Exception as e:
             err_str = str(e)
-            # 针对底层 in flight 错误的二次友好翻译（兜底防线）
             if "already in flight" in err_str:
                 status_msg = self._get_active_task_status_message(stream_id)
                 await self.ctx.send.text(status_msg or "（晃了晃尾巴）DSH 正在全力执行刚才的任务中，请稍候片刻~ 🐾", stream_id)
