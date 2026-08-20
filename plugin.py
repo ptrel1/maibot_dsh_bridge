@@ -1,4 +1,4 @@
-"""MaiBot Plugin Entry: DSH Bridge with Smart Session Matching/Forking (Plan B), 20min Long Task & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with Configurable Persona, Plan B Smart Session & Safety Guard."""
 
 import asyncio
 import difflib
@@ -55,10 +55,8 @@ def calculate_task_similarity(new_task: str, old_task: str) -> float:
     """基于词重合度与字符序列比对计算任务相似度 (0.0 ~ 1.0)。"""
     if not new_task or not old_task:
         return 0.0
-    # 提取关键汉字和英文单词
     seq_ratio = difflib.SequenceMatcher(None, new_task, old_task).ratio()
     
-    # 检查关键词共现（如相同的目录路径、文件名、模块名）
     paths_new = set(re.findall(r"[\w\-\./]+/[^\s,，。]+", new_task))
     paths_old = set(re.findall(r"[\w\-\./]+/[^\s,，。]+", old_task))
     path_overlap = len(paths_new & paths_old) / max(len(paths_new | paths_old), 1) if (paths_new or paths_old) else 0.0
@@ -146,10 +144,25 @@ class PermissionsSectionConfig(PluginConfigBase):
     )
 
 
+class PersonaSectionConfig(PluginConfigBase):
+    __ui_label__ = "DSH 角色与提示词模式"
+    __ui_icon__ = "user-check"
+    __ui_order__ = 1
+
+    mode_name: str = Field(
+        default="d_teacher",
+        description="DSH 执行模式：d_teacher (代码专家/三步法) 或 custom (自定义模式)",
+    )
+    custom_system_prompt: str = Field(
+        default="",
+        description="自定义模式下的 System Prompt 前置系统提示词（为空时使用 D 老师默认三步法与规范）",
+    )
+
+
 class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "基础开关"
     __ui_icon__ = "settings"
-    __ui_order__ = 1
+    __ui_order__ = 2
 
     enabled: bool = Field(default=True, description="是否启用 DSH 智能体桥接插件")
     config_version: str = Field(default="0.1.0", description="配置版本")
@@ -168,7 +181,7 @@ class PluginSectionConfig(PluginConfigBase):
 class AcpSectionConfig(PluginConfigBase):
     __ui_label__ = "原生 ACP 模式配置"
     __ui_icon__ = "terminal"
-    __ui_order__ = 2
+    __ui_order__ = 3
 
     dsh_bin: str = Field(default="/home/a1/.npm-global/bin/dsh", description="dsh 全局执行文件路径")
     default_cwd: str = Field(default="/main/app/github/deepseek-harness", description="默认工作目录")
@@ -177,7 +190,7 @@ class AcpSectionConfig(PluginConfigBase):
 class PostSectionConfig(PluginConfigBase):
     __ui_label__ = "HTTP POST 模式配置"
     __ui_icon__ = "web"
-    __ui_order__ = 3
+    __ui_order__ = 4
 
     gateway_url: str = Field(default="http://127.0.0.1:3080/api/dsh/v1", description="DSH Post Gateway API 前缀")
     token: str = Field(default="Qq13235202993", description="网关访问 Token")
@@ -185,6 +198,7 @@ class PostSectionConfig(PluginConfigBase):
 
 class DshBridgeConfig(PluginConfigBase):
     permissions: PermissionsSectionConfig = Field(default_factory=PermissionsSectionConfig)
+    persona: PersonaSectionConfig = Field(default_factory=PersonaSectionConfig)
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     acp: AcpSectionConfig = Field(default_factory=AcpSectionConfig)
     post: PostSectionConfig = Field(default_factory=PostSectionConfig)
@@ -212,7 +226,8 @@ class DshBridgePlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
         self.ctx.logger.info(
-            "DSH Bridge 插件已加载 [方案B: 智能会话继承模式]，模式: %s，管理员数: %d，提示词池: %d 条",
+            "DSH Bridge 插件已加载，DSH模式: %s，通信: %s，管理员数: %d，提示词池: %d 条",
+            cfg.persona.mode_name,
             cfg.plugin.mode,
             len(cfg.permissions.admin_users),
             len(self._prompt_pool),
@@ -264,12 +279,11 @@ class DshBridgePlugin(MaiBotPlugin):
         history_list = self._chat_session_history.setdefault(stream_id, [])
         now = time.time()
 
-        # 1. 显式上下文代词与追问判断（"继续"、"刚才的"、"接着改"、"再优化一下"）
+        # 1. 显式上下文代词与追问判断
         continuation_patterns = [r"^(?:继续|接着|刚才|上一条|再改|在这个基础上|顺便把)", r"(?:刚才|之前|上面).*(?:修改|代码|文件|结果)"]
         is_explicit_continue = any(re.search(pat, task) for pat in continuation_patterns)
 
         if is_explicit_continue and history_list:
-            # 命中显式追问：直接继承最新的一个历史会话
             latest_record = history_list[-1]
             latest_record.last_used_at = now
             latest_record.turn_count += 1
@@ -306,7 +320,6 @@ class DshBridgePlugin(MaiBotPlugin):
             created_at=now,
         )
         history_list.append(new_record)
-        # 最多保留最近 15 个会话索引
         if len(history_list) > 15:
             history_list.pop(0)
 
@@ -377,8 +390,14 @@ class DshBridgePlugin(MaiBotPlugin):
         dsh_session: Optional[str] = None,
         progress_cb: Optional[Callable[[str, int], Any]] = None,
     ) -> str:
-        """统一执行 DSH 任务核心（方案B：支持动态会话路由、20分钟长任务与周期心跳总结）。"""
+        """统一执行 DSH 任务核心（支持自定义 Persona 提示词注入）。"""
         cfg = cast(DshBridgeConfig, self.config)
+
+        # 如果配置了自定义 System Prompt，在此处前置拼装
+        final_prompt = task
+        if cfg.persona.mode_name == "custom" and cfg.persona.custom_system_prompt.strip():
+            custom_head = cfg.persona.custom_system_prompt.strip()
+            final_prompt = f"【系统指令】\n{custom_head}\n\n【用户任务】\n{task}"
 
         if cfg.plugin.mode == "acp":
             client = await self._ensure_acp_client()
@@ -419,7 +438,7 @@ class DshBridgePlugin(MaiBotPlugin):
             hb_task = asyncio.create_task(_heartbeat_worker())
 
             try:
-                return await client.prompt(dsh_session, task, timeout=max_timeout)
+                return await client.prompt(dsh_session, final_prompt, timeout=max_timeout)
             finally:
                 hb_task.cancel()
                 self._active_tasks.pop(stream_id, None)
@@ -429,7 +448,7 @@ class DshBridgePlugin(MaiBotPlugin):
             import json
 
             url = f"{cfg.post.gateway_url.rstrip('/')}/task"
-            req_data = json.dumps({"prompt": task}).encode("utf-8")
+            req_data = json.dumps({"prompt": final_prompt}).encode("utf-8")
             headers = {"Content-Type": "application/json"}
             token = cfg.post.token.strip() or "Qq13235202993"
             if token:
@@ -517,9 +536,7 @@ class DshBridgePlugin(MaiBotPlugin):
         user_id = str(user_info.get("user_id", "")).strip()
         is_admin = self._is_admin_user(user_id)
 
-        # -----------------------------------------------------------------
         # 0. 优先检测自然语言【停止/中断/取消】请求
-        # -----------------------------------------------------------------
         stop_patterns = [
             r"^(?:停止|取消|中断|别跑了|不要跑了|停下|终止)\s*(?:dsh|任务|执行)?$",
             r"^(?:dsh|deepseek[-_ ]?harness)\s*(?:stop|cancel|停止|取消)$",
@@ -536,9 +553,7 @@ class DshBridgePlugin(MaiBotPlugin):
                 await self.ctx.send.text("（左右张望）当前会话没有正在运行中的 DSH 任务哦~ 🫧", stream_id)
             return
 
-        # -----------------------------------------------------------------
         # 1. 显式【开启全新会话】指令检测 (#dsh new / 重置dsh会话)
-        # -----------------------------------------------------------------
         reset_patterns = [
             r"^(?:重置|清空|新建|开启新)\s*(?:dsh|会话|上下文)$",
             r"^#dsh\s*(?:new|reset|clean)$",
@@ -600,14 +615,13 @@ class DshBridgePlugin(MaiBotPlugin):
             client = await self._ensure_acp_client()
             chosen_session = await client.create_session()
             session_action = "new"
-            # 记入历史索引
             self._chat_session_history.setdefault(stream_id, []).append(
                 SessionHistoryRecord(chosen_session, matched_task[:80], matched_task, time.time())
             )
         else:
             chosen_session, session_action = await self._resolve_smart_session(stream_id, matched_task)
 
-        # 动态人设提示词（从缓存池抽选并告知用户是否继承了上下文）
+        # 动态人设提示词
         hint_message = self._get_random_prompt_hint(matched_task, session_action=session_action)
         await self.ctx.send.text(hint_message, stream_id)
 

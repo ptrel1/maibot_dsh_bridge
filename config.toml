@@ -2,6 +2,12 @@
 admin_users = ["3854532368", "1350093676", "1021143806"]
 allow_guest_users = true
 
+[persona]
+# DSH 执行模式：d_teacher (代码专家/三步法) 或 custom (自定义模式)
+mode_name = "d_teacher"
+# 自定义模式下的 System Prompt（当 mode_name = "custom" 时生效，支持完全自定义）
+custom_system_prompt = ""
+
 [plugin]
 enabled = true
 config_version = "0.1.0"
@@ -13,11 +19,12 @@ prompt_refresh_interval = 10
 prompt_pool_max_size = 12
 heartbeat_interval_sec = 300.0
 max_timeout_sec = 1800.0
+session_match_threshold = 0.45
+session_idle_expire_sec = 1800.0
 
 [acp]
 dsh_bin = "/home/a1/.npm-global/bin/dsh"
 default_cwd = "/main/app/github/deepseek-harness"
-timeout = 180.0
 
 [post]
 gateway_url = "http://127.0.0.1:3080/api/dsh/v1"
