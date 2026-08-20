@@ -1,4 +1,4 @@
-"""MaiBot Plugin Entry: DSH Bridge with Duplicate Filter, Non-blocking @Tool, Plan B Session & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with Autonomous Non-blocking @Tool, Plan B Session & Safety Guard."""
 
 import asyncio
 import difflib
@@ -232,7 +232,7 @@ class DshBridgePlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
         self.ctx.logger.info(
-            "DSH Bridge 插件已加载 [防重过滤 & 非阻塞模式]，模式: %s，管理员数: %d，提示词池: %d 条",
+            "DSH Bridge 插件已加载 [智能意图感知 & 自动触发]，模式: %s，管理员数: %d，提示词池: %d 条",
             cfg.plugin.mode,
             len(cfg.permissions.admin_users),
             len(self._prompt_pool),
@@ -260,23 +260,17 @@ class DshBridgePlugin(MaiBotPlugin):
         return str(user_id).strip() in admins
 
     def _check_and_record_duplicate(self, stream_id: str, task_text: str, dedupe_window_sec: float = 10.0) -> bool:
-        """检测短时间内是否有完全相同的任务重复触发（防 HookHandler 与 @Tool 重复响应）。
-        
-        Returns:
-            bool: True 表示是重复触发（应丢弃），False 表示首次触发。
-        """
+        """检测短时间内是否有完全相同的任务重复触发。"""
         now = time.time()
         normalized_task = task_text.strip()
         last_entry = self._recent_triggers.get(stream_id)
 
         if last_entry:
             last_task, last_time = last_entry
-            # 同一会话流、完全相同的内容、且在防重时间窗口内
             if last_task == normalized_task and (now - last_time) < dedupe_window_sec:
                 self.ctx.logger.info("检测到重复指令 (在 %.1fs 内): '%s'，已自动去重忽略", now - last_time, normalized_task[:40])
                 return True
 
-        # 记录本次触发
         self._recent_triggers[stream_id] = (normalized_task, now)
         return False
 
@@ -306,7 +300,6 @@ class DshBridgePlugin(MaiBotPlugin):
         history_list = self._chat_session_history.setdefault(stream_id, [])
         now = time.time()
 
-        # 1. 显式上下文代词与追问判断
         continuation_patterns = [r"^(?:继续|接着|刚才|上一条|再改|在这个基础上|顺便把)", r"(?:刚才|之前|上面).*(?:修改|代码|文件|结果)"]
         is_explicit_continue = any(re.search(pat, task) for pat in continuation_patterns)
 
@@ -317,7 +310,6 @@ class DshBridgePlugin(MaiBotPlugin):
             self.ctx.logger.info("命中显式追问意图，继承最近 Session: %s", latest_record.session_id)
             return latest_record.session_id, "resume"
 
-        # 2. 遍历历史会话计算语义与路径相关度
         best_record: Optional[SessionHistoryRecord] = None
         best_score = 0.0
         expire_sec = cfg.plugin.session_idle_expire_sec
@@ -338,7 +330,6 @@ class DshBridgePlugin(MaiBotPlugin):
             self.ctx.logger.info("智能命中历史任务 (相似度 %.2f >= %.2f)，继承 Session: %s", best_score, threshold, best_record.session_id)
             return best_record.session_id, "resume"
 
-        # 3. 相似度不足或全新话题：创建独立 Session 隔离环境
         new_session_id = await client.create_session()
         new_record = SessionHistoryRecord(
             session_id=new_session_id,
@@ -527,7 +518,7 @@ class DshBridgePlugin(MaiBotPlugin):
 
         stream_id = self._last_stream_id or "default"
 
-        # 防重校验（避免 HookHandler 已经启动了，Maisaka 模型又在当前轮次调用 @Tool 重复跑一遍）
+        # 防重校验
         if self._check_and_record_duplicate(stream_id, task, dedupe_window_sec=10.0):
             return {
                 "name": "dsh_execute_task",
@@ -536,7 +527,7 @@ class DshBridgePlugin(MaiBotPlugin):
 
         self.ctx.logger.info("Maisaka 模型调用 DSH 工具 (非阻塞派发): %s", task)
 
-        # 启动后台异步任务并自动推送到当前会话流，彻底解耦 RPC 管道
+        # 启动后台异步任务并自动推送到当前会话流
         asyncio.create_task(self._run_and_reply(task, stream_id))
 
         return {
@@ -545,7 +536,7 @@ class DshBridgePlugin(MaiBotPlugin):
         }
 
     # =========================================================================
-    # 2. 消息前置拦截（支持智能会话继承、强制新会话、停止控制与白名单权限）
+    # 2. 消息前置拦截（泛化自然语言意图感知，无需硬套公式）
     # =========================================================================
 
     @HookHandler(
@@ -616,25 +607,31 @@ class DshBridgePlugin(MaiBotPlugin):
                 )
                 return
 
-        # 方式 B：自然语言意图正则识别
+        # 方式 B：全场景泛化自然语言意图感知（支持任意位置带 dsh，或明显的代码/git/排查意图）
         elif cfg.plugin.enable_natural_language:
-            patterns = [
-                r"^(?:请|帮我|让)?(?:使用|调用|通过|用)?(?:dsh|deepseek[-_ ]?harness)(?:去|帮我|来)?(.+)$",
-                r"^(?:问一下|请问|查一下)?(?:dsh|deepseek[-_ ]?harness)(?:：|:|\s+)(.+)$",
-                r"^dsh\s+(.+)$",
-            ]
-            for pat in patterns:
-                m = re.search(pat, text, re.IGNORECASE)
-                if m:
-                    candidate = m.group(1).strip()
-                    if len(candidate) >= 2 and not candidate.startswith("是什么") and not candidate.startswith("吗"):
-                        matched_task = candidate
+            # 1. 明确提及 DSH 的任意句式（如 "看下git版本，用dsh跑下" / "dsh 查下日志" / "帮我让dsh改代码"）
+            m_dsh = re.search(r"(?:^|\s|，|,|。|！|!)(?:请|帮我|让|使用|调用|通过|用)?(?:dsh|deepseek[-_ ]?harness)(?:去|帮我|来|：|:|\s+)?(.+)$", text, re.IGNORECASE)
+            if m_dsh:
+                candidate = m_dsh.group(1).strip()
+                if len(candidate) >= 2 and not candidate.startswith("是什么") and not candidate.startswith("吗"):
+                    matched_task = candidate
+
+            # 2. 强工程意图前缀（即便没写 dsh 单词，但有明确的跨工程指令如 "按照skill更新maibot" / "检查git版本与主分支"）
+            if not matched_task:
+                engineering_patterns = [
+                    r"^(?:按照|参考|根据)\s*skill\s*(.+)$",
+                    r"^(?:检查|查看|看下|对比)\s*(?:git\s*版本|代码分支|主分支落后).+$",
+                    r"^(?:排查|分析|诊断)\s*(?:/main/log|/main/app|supervisor\s*日志).+$",
+                ]
+                for ep in engineering_patterns:
+                    if re.search(ep, text, re.IGNORECASE):
+                        matched_task = text
                         break
 
         if not matched_task:
             return
 
-        # 防重复触发拦截（防短时间内重复指令发送）
+        # 防重复触发拦截
         if self._check_and_record_duplicate(stream_id, matched_task, dedupe_window_sec=10.0):
             return
 
@@ -651,7 +648,7 @@ class DshBridgePlugin(MaiBotPlugin):
             await self.ctx.send.text(f"🛡️ [权限安全拦截] {reason}", stream_id)
             return
 
-        # 方案 B 核心：智能裁决会话是继承历史还是开启新会话
+        # 方案 B 核心：智能裁决会话
         if force_new_session:
             client = await self._ensure_acp_client()
             chosen_session = await client.create_session()
