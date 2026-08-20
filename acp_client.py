@@ -3,15 +3,16 @@
 import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, Optional
+import os
+from typing import Any, Dict, Optional
 
 
 class DshAcpClient:
-    """Manages an active `dsh --profile acp` subprocess and communicates via JSON-RPC stdio."""
+    """Manages an active DSH ACP demo server subprocess and communicates via JSON-RPC stdio."""
 
     def __init__(
         self,
-        dsh_bin: str = "dsh",
+        dsh_bin: str = "node",
         cwd: str = "/main/app/github/deepseek-harness",
         provider: str = "deepseek",
         model: str = "deepseek-chat",
@@ -38,25 +39,36 @@ class DshAcpClient:
                 return True
 
             try:
-                self.logger.info("Starting DSH ACP server: %s --profile acp", self.dsh_bin)
+                acp_bin = "/main/app/github/deepseek-harness/packages/examples/acp-demo/lib/bin.js"
+                acp_config = "/main/app/github/deepseek-harness/examples/acp-agent/cordis.yml"
+
+                # 提取环境变量中的 DEEPSEEK_API_KEY
+                env = dict(os.environ)
+                if "DEEPSEEK_API_KEY" not in env:
+                    # 从 .env 或父进程环境变量继承
+                    env["DEEPSEEK_API_KEY"] = os.environ.get("DEEPSEEK_API_KEY", "")
+
+                self.logger.info("Starting DSH ACP server: node %s --config %s", acp_bin, acp_config)
                 self._process = await asyncio.create_subprocess_exec(
-                    self.dsh_bin,
-                    "--profile",
-                    "acp",
+                    "node",
+                    acp_bin,
+                    "--config",
+                    acp_config,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    env=env,
                 )
                 self._running = True
                 self._reader_task = asyncio.create_task(self._read_loop())
 
-                # Step 1: Handshake initialize
+                # Step 1: Handshake initialize (protocolVersion must be integer: 1)
                 init_res = await self._send_request(
                     "initialize",
                     {
-                        "protocolVersion": "1.0",
+                        "protocolVersion": 1,
                         "clientInfo": {"name": "maibot-dsh-bridge", "version": "0.1.0"},
-                        "capabilities": {"promptImage": False},
+                        "capabilities": {},
                     },
                 )
                 self.logger.info("DSH ACP server initialized successfully: %s", init_res)
@@ -95,7 +107,12 @@ class DshAcpClient:
             await self.start()
 
         target_cwd = cwd or self.default_cwd
-        res = await self._send_request("session/new", {"cwd": target_cwd})
+        params = {
+            "cwd": target_cwd,
+            "mcpServers": [],
+            "additionalDirectories": [],
+        }
+        res = await self._send_request("session/new", params)
         session_id = res.get("sessionId")
         if not session_id:
             raise RuntimeError(f"Failed to obtain sessionId from ACP: {res}")
@@ -115,12 +132,12 @@ class DshAcpClient:
         self._session_listeners[session_id] = queue
 
         try:
-            # Enqueue prompt
+            # ACP session/prompt wire schema expects "prompt": [{"type": "text", "text": "..."}]
             prompt_fut = self._send_request(
                 "session/prompt",
                 {
                     "sessionId": session_id,
-                    "contentBlocks": [{"type": "text", "text": text}],
+                    "prompt": [{"type": "text", "text": text}],
                 },
             )
 
@@ -196,9 +213,10 @@ class DshAcpClient:
                 if method == "session/update":
                     sess_id = params.get("sessionId")
                     update = params.get("update", {})
-                    # Chunk delivered
-                    if update.get("type") == "agent_message_chunk":
-                        chunk = update.get("content", {}).get("text", "")
+                    # Chunk delivered (sessionUpdate: "agent_message_chunk")
+                    if update.get("sessionUpdate") == "agent_message_chunk" or update.get("type") == "agent_message_chunk":
+                        content = update.get("content", {})
+                        chunk = content.get("text", "") if isinstance(content, dict) else str(content)
                         if sess_id in self._session_listeners:
                             self._session_listeners[sess_id].put_nowait(chunk)
 
