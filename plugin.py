@@ -304,10 +304,16 @@ class DshBridgePlugin(MaiBotPlugin):
 
             url = f"{cfg.post.gateway_url.rstrip('/')}/task"
             req_data = json.dumps({"prompt": task}).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            token = cfg.post.token.strip() or "Qq13235202993"
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+                headers["X-Gateway-Token"] = token
+
             req = urllib.request.Request(
                 url,
                 data=req_data,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 method="POST",
             )
             loop = asyncio.get_running_loop()
@@ -341,6 +347,7 @@ class DshBridgePlugin(MaiBotPlugin):
             ),
         ],
         visibility="visible",
+        timeout_ms=180000,
     )
     async def handle_tool_dsh(self, task: str = "", **kwargs: Any) -> Dict[str, Any]:
         """Maisaka 模型调用 DSH 工具回调。"""
