@@ -1,9 +1,10 @@
-"""High-Performance, Retina HD Markdown Card Image Renderer using Pillow with True CJK Fonts & Emoji Sanitizer."""
+"""High-Performance, Retina HD Markdown Card Image Renderer with Bundled DFPYuanW7 (华康圆体)."""
 
 import base64
 import io
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont
 
@@ -55,13 +56,14 @@ def sanitize_text_for_cjk(text: str) -> str:
 
 
 def _load_cjk_fonts() -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
-    """智能查找系统中可用的真实中文字体。"""
+    """优先加载插件内置的【华康圆体 W7】（DFPYuanW7.ttf），保障在任何机器上视觉效果绝对一致。"""
+    pkg_font = str(Path(__file__).resolve().parent / "assets" / "fonts" / "DFPYuanW7.ttf")
+    
     font_candidates = [
-        "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
+        pkg_font,
         "/usr/local/share/fonts/华/华康圆体W7.ttf",
+        "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf",
     ]
     
     valid_font = None
@@ -72,6 +74,7 @@ def _load_cjk_fonts() -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
 
     if valid_font:
         try:
+            # 华康圆体 W7 视网膜高清排版字号
             f_title = ImageFont.truetype(valid_font, 36)
             f_h1 = ImageFont.truetype(valid_font, 30)
             f_h2 = ImageFont.truetype(valid_font, 26)
@@ -92,7 +95,7 @@ def render_markdown_to_card_image(
     title: str = "DeepSeek Harness 交付报告",
     stats_meta: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """使用 Pillow 原生离线渲染 Retina 2x 超清深色卡片长图（自动消毒 Emoji 杜绝方块口）。"""
+    """使用 Pillow 原生离线渲染 Retina 2x 超清深色卡片长图（基于内置华康圆体渲染）。"""
     try:
         width = 1300
         padding = 48
