@@ -1,4 +1,4 @@
-"""MaiBot Plugin Entry: DSH Bridge with Autonomous Non-blocking @Tool, Plan B Session & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with Duplicate Filter, Non-blocking @Tool, Plan B Session & Safety Guard."""
 
 import asyncio
 import difflib
@@ -223,13 +223,16 @@ class DshBridgePlugin(MaiBotPlugin):
     # 活跃中的任务句柄映射: stream_id -> (dsh_session, asyncio.Task)
     _active_tasks: Dict[str, Tuple[str, asyncio.Task]] = {}
 
+    # 防重复触发记录: stream_id -> (last_task_text, timestamp)
+    _recent_triggers: Dict[str, Tuple[str, float]] = {}
+
     # 记录每个会话流最近活跃的 session_id（供 @Tool 快速定位目标群/私聊）
     _last_stream_id: str = ""
 
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
         self.ctx.logger.info(
-            "DSH Bridge 插件已加载 [独立非阻塞模式]，模式: %s，管理员数: %d，提示词池: %d 条",
+            "DSH Bridge 插件已加载 [防重过滤 & 非阻塞模式]，模式: %s，管理员数: %d，提示词池: %d 条",
             cfg.plugin.mode,
             len(cfg.permissions.admin_users),
             len(self._prompt_pool),
@@ -243,6 +246,7 @@ class DshBridgePlugin(MaiBotPlugin):
             t.cancel()
         self._active_tasks.clear()
         self._chat_session_history.clear()
+        self._recent_triggers.clear()
         self.ctx.logger.info("DSH Bridge 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -254,6 +258,27 @@ class DshBridgePlugin(MaiBotPlugin):
         cfg = cast(DshBridgeConfig, self.config)
         admins = [str(u).strip() for u in cfg.permissions.admin_users]
         return str(user_id).strip() in admins
+
+    def _check_and_record_duplicate(self, stream_id: str, task_text: str, dedupe_window_sec: float = 10.0) -> bool:
+        """检测短时间内是否有完全相同的任务重复触发（防 HookHandler 与 @Tool 重复响应）。
+        
+        Returns:
+            bool: True 表示是重复触发（应丢弃），False 表示首次触发。
+        """
+        now = time.time()
+        normalized_task = task_text.strip()
+        last_entry = self._recent_triggers.get(stream_id)
+
+        if last_entry:
+            last_task, last_time = last_entry
+            # 同一会话流、完全相同的内容、且在防重时间窗口内
+            if last_task == normalized_task and (now - last_time) < dedupe_window_sec:
+                self.ctx.logger.info("检测到重复指令 (在 %.1fs 内): '%s'，已自动去重忽略", now - last_time, normalized_task[:40])
+                return True
+
+        # 记录本次触发
+        self._recent_triggers[stream_id] = (normalized_task, now)
+        return False
 
     def _get_random_prompt_hint(self, task_desc: str, session_action: str = "new") -> str:
         """从当前缓存池随机抽选一句人设提示语，并附带上下文继承说明。"""
@@ -501,12 +526,19 @@ class DshBridgePlugin(MaiBotPlugin):
             return {"name": "dsh_execute_task", "content": "任务内容为空"}
 
         stream_id = self._last_stream_id or "default"
+
+        # 防重校验（避免 HookHandler 已经启动了，Maisaka 模型又在当前轮次调用 @Tool 重复跑一遍）
+        if self._check_and_record_duplicate(stream_id, task, dedupe_window_sec=10.0):
+            return {
+                "name": "dsh_execute_task",
+                "content": "任务已在后台执行中，无需重复派发。你可以直接告诉用户'任务正在后台处理中'。",
+            }
+
         self.ctx.logger.info("Maisaka 模型调用 DSH 工具 (非阻塞派发): %s", task)
 
         # 启动后台异步任务并自动推送到当前会话流，彻底解耦 RPC 管道
         asyncio.create_task(self._run_and_reply(task, stream_id))
 
-        # 毫秒级直接向大模型返回确认状态，防止 RPC 超时
         return {
             "name": "dsh_execute_task",
             "content": f"任务已成功在后台分派给 DSH 智能体执行。小鲸鱼正在为您持续监视并在完成后自动发送报告，你可以直接告诉用户'任务已在后台启动'。",
@@ -600,6 +632,10 @@ class DshBridgePlugin(MaiBotPlugin):
                         break
 
         if not matched_task:
+            return
+
+        # 防重复触发拦截（防短时间内重复指令发送）
+        if self._check_and_record_duplicate(stream_id, matched_task, dedupe_window_sec=10.0):
             return
 
         # 非管理员游客权限开关检查
