@@ -372,9 +372,11 @@ class DshBridgePlugin(MaiBotPlugin):
         """异步执行 DSH 任务并回复群聊/私聊。"""
         try:
             result = await self._execute_dsh_task(task, stream_id=stream_id)
-            await self.ctx.send.text(result, stream_id)
+            success_head = random.choice(DEFAULT_SUCCESS_HEADS)
+            await self.ctx.send.text(f"{success_head}\n\n{result}", stream_id)
         except Exception as e:
             self.ctx.logger.error("DSH 任务执行异常: %s", e, exc_info=True)
+            # 报错信息直接原样输出，不加任何多余包装
             await self.ctx.send.text(str(e), stream_id)
 
 
