@@ -1,4 +1,4 @@
-"""MaiBot Plugin Entry: DSH Bridge with Single-Execution Lock, Plan B Session & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with In-flight Progress Reporting, Plan B Session & Safety Guard."""
 
 import asyncio
 import difflib
@@ -238,11 +238,8 @@ class DshBridgePlugin(MaiBotPlugin):
     _call_count: int = 0
     _refreshing_prompts: bool = False
 
-    # 活跃中的任务句柄映射: stream_id -> (dsh_session, asyncio.Task)
-    _active_tasks: Dict[str, Tuple[str, asyncio.Task]] = {}
-
-    # 全局会话执行锁：stream_id -> (task_text, timestamp)
-    _running_lock_by_stream: Dict[str, Tuple[str, float]] = {}
+    # 活跃中的任务句柄映射: stream_id -> (dsh_session, task_desc, start_time, asyncio.Task)
+    _active_tasks: Dict[str, Tuple[str, str, float, asyncio.Task]] = {}
 
     # 记录每个会话流最近活跃的 session_id
     _last_stream_id: str = ""
@@ -261,11 +258,10 @@ class DshBridgePlugin(MaiBotPlugin):
         if self._acp_client:
             await self._acp_client.stop()
             self._acp_client = None
-        for _, (_, t) in self._active_tasks.items():
+        for _, (_, _, _, t) in self._active_tasks.items():
             t.cancel()
         self._active_tasks.clear()
         self._chat_session_history.clear()
-        self._running_lock_by_stream.clear()
         self.ctx.logger.info("DSH Bridge 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -278,25 +274,33 @@ class DshBridgePlugin(MaiBotPlugin):
         admins = [str(u).strip() for u in cfg.permissions.admin_users]
         return str(user_id).strip() in admins
 
-    def _acquire_task_lock(self, stream_id: str, task_text: str, lock_window_sec: float = 15.0) -> bool:
-        """获取任务执行锁（若同一会话在 lock_window_sec 内有相同或正在执行的任务则拦截，杜绝双发）。
-        
-        Returns:
-            bool: True 表示成功抢占锁（允许执行）；False 表示已被占用（拦截重复执行）。
-        """
-        now = time.time()
-        normalized_task = task_text.strip()
+    def _get_active_task_status_message(self, stream_id: str) -> Optional[str]:
+        """方案 1 核心：当会话繁忙时，提取当前正在执行的任务状态、耗时与中间输出，生成贴心回复。"""
+        if stream_id not in self._active_tasks:
+            return None
 
-        # 检查是否已有正在运行的同一任务
-        if stream_id in self._running_lock_by_stream:
-            last_task, last_time = self._running_lock_by_stream[stream_id]
-            if (now - last_time) < lock_window_sec:
-                self.ctx.logger.info("同一任务正在执行或刚触发 (%.1fs 前): '%s'，拦截二次执行", now - last_time, normalized_task[:30])
-                return False
+        dsh_session, task_desc, start_time, _ = self._active_tasks[stream_id]
+        elapsed = int(time.time() - start_time)
+        time_str = f"{elapsed} 秒" if elapsed < 60 else f"{elapsed // 60} 分 {elapsed % 60} 秒"
 
-        # 抢占锁
-        self._running_lock_by_stream[stream_id] = (normalized_task, now)
-        return True
+        # 尝试提取已收到的中间片段
+        accumulated = ""
+        if self._acp_client:
+            listener = self._acp_client._session_listeners.get(dsh_session)
+            if listener and listener._queue:
+                latest_chunk = listener._queue[-1].strip()
+                if latest_chunk:
+                    accumulated = f"\n🫧 当前最新进展：{latest_chunk[:100]}..."
+
+        msg = (
+            f"（晃了晃鲸鱼尾巴）主人别急呀~ 上一个 DSH 任务正在全力执行中哦！\n\n"
+            f"📋 当前进行中任务：【{task_desc[:50]}】\n"
+            f"⏱️ 已持续耗时：{time_str}{accumulated}\n\n"
+            f"💡 温馨提示：\n"
+            f"• 如需中止当前任务，请发送「停止dsh」\n"
+            f"• 如需独立开启全新任务，请发送「#dsh new <新任务>」"
+        )
+        return msg
 
     def _get_random_prompt_hint(self, task_desc: str, session_action: str = "new") -> str:
         """从当前缓存池随机抽选一句人设提示语，并附带模型与上下文继承说明。"""
@@ -435,7 +439,7 @@ class DshBridgePlugin(MaiBotPlugin):
         dsh_session: Optional[str] = None,
         progress_cb: Optional[Callable[[str, int], Any]] = None,
     ) -> str:
-        """统一执行 DSH 任务核心（支持自定义模型注入）。"""
+        """统一执行 DSH 任务核心。"""
         cfg = cast(DshBridgeConfig, self.config)
 
         final_prompt = task
@@ -453,7 +457,7 @@ class DshBridgePlugin(MaiBotPlugin):
 
             current_task = asyncio.current_task()
             if current_task:
-                self._active_tasks[stream_id] = (dsh_session, current_task)
+                self._active_tasks[stream_id] = (dsh_session, task, time.time(), current_task)
 
             heartbeat_interval = max(cfg.plugin.heartbeat_interval_sec, 60.0)
             max_timeout = max(cfg.plugin.max_timeout_sec, 180.0)
@@ -517,14 +521,14 @@ class DshBridgePlugin(MaiBotPlugin):
         return "(未知的通信模式，请检查插件配置)"
 
     # =========================================================================
-    # 1. 注册 Tool 给 Maisaka 大模型（仅做被动答疑/查询，不再重复启动执行协程）
+    # 1. 注册 Tool 给 Maisaka 大模型
     # =========================================================================
 
     @Tool(
         "dsh_execute_task",
         description=(
             "DeepSeek Harness (DSH) 重型智能体执行工具。"
-            "当用户在对话中要求编写代码、修改项目文件、排查服务器日志、执行沙盒测试或分析工程结构时，优先告知用户后台正在处理。"
+            "当用户在对话中要求编写代码、修改项目文件、排查服务器日志、执行沙盒测试或分析工程结构时调用此工具。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -537,18 +541,18 @@ class DshBridgePlugin(MaiBotPlugin):
         visibility="visible",
     )
     async def handle_tool_dsh(self, task: str = "", **kwargs: Any) -> Dict[str, Any]:
-        """Maisaka 模型调用 DSH 工具回调（返回状态确认，避免与 HookHandler 重复执行）。"""
+        """Maisaka 模型调用 DSH 工具回调。"""
         del kwargs
         stream_id = self._last_stream_id or "default"
 
-        # 如果 HookHandler 已经拿到锁在跑了，大模型此处直接返回确认
-        if not self._acquire_task_lock(stream_id, task, lock_window_sec=15.0):
+        # 方案 1：检查是否有正在执行的任务
+        if stream_id in self._active_tasks:
+            status_msg = self._get_active_task_status_message(stream_id)
             return {
                 "name": "dsh_execute_task",
-                "content": "任务已在后台执行中，小鲸鱼正在为您监视并在完成后自动发送报告，你可以直接告诉用户'任务已在后台启动'。",
+                "content": status_msg or "任务已在后台执行中，请耐心等待。",
             }
 
-        # 仅当 HookHandler 漏掉时（如非前缀且非正则识别到的边缘场景），才由 Tool 补充启动
         self.ctx.logger.info("Maisaka 模型主动触发 DSH 任务派发: %s", task)
         asyncio.create_task(self._run_and_reply(task, stream_id))
 
@@ -558,7 +562,7 @@ class DshBridgePlugin(MaiBotPlugin):
         }
 
     # =========================================================================
-    # 2. 消息前置拦截（主执行入口：抢占锁后唯一启动）
+    # 2. 消息前置拦截（方案1：智能识别繁忙状态并优雅汇报进度）
     # =========================================================================
 
     @HookHandler(
@@ -593,7 +597,7 @@ class DshBridgePlugin(MaiBotPlugin):
         ]
         if any(re.search(pat, text, re.IGNORECASE) for pat in stop_patterns):
             if stream_id in self._active_tasks:
-                dsh_session, task_handle = self._active_tasks.pop(stream_id)
+                dsh_session, _, _, task_handle = self._active_tasks.pop(stream_id)
                 task_handle.cancel()
                 if self._acp_client:
                     asyncio.create_task(self._acp_client.cancel_session(dsh_session))
@@ -648,9 +652,12 @@ class DshBridgePlugin(MaiBotPlugin):
         if not matched_task:
             return
 
-        # 抢占任务锁（杜绝与模型 @Tool 双重触发）
-        if not self._acquire_task_lock(stream_id, matched_task, lock_window_sec=15.0):
-            return
+        # 方案 1 核心拦截：如果当前已有任务在执行，且未显式要求 force_new_session
+        if stream_id in self._active_tasks and not force_new_session:
+            status_reply = self._get_active_task_status_message(stream_id)
+            if status_reply:
+                await self.ctx.send.text(status_reply, stream_id)
+                return
 
         # 权限检查
         if not is_admin and not cfg.permissions.allow_guest_users:
@@ -694,8 +701,14 @@ class DshBridgePlugin(MaiBotPlugin):
         except asyncio.CancelledError:
             self.ctx.logger.info("DSH 任务已被用户主动取消: %s", stream_id)
         except Exception as e:
-            self.ctx.logger.error("DSH 任务执行异常: %s", e, exc_info=True)
-            await self.ctx.send.text(str(e), stream_id)
+            err_str = str(e)
+            # 针对底层 in flight 错误的二次友好翻译（兜底防线）
+            if "already in flight" in err_str:
+                status_msg = self._get_active_task_status_message(stream_id)
+                await self.ctx.send.text(status_msg or "（晃了晃尾巴）DSH 正在全力执行刚才的任务中，请稍候片刻~ 🐾", stream_id)
+            else:
+                self.ctx.logger.error("DSH 任务执行异常: %s", e, exc_info=True)
+                await self.ctx.send.text(err_str, stream_id)
 
     async def _deliver_hybrid_result(self, raw_result: str, stream_id: str, stats_meta: Optional[Dict[str, Any]] = None) -> None:
         """方案 C 核心：字数 > 200 或包含代码/表格时，直接渲染 GitHub 深色长图发送。"""
