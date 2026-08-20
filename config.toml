@@ -8,6 +8,11 @@ mode_name = "d_teacher"
 # 自定义模式下的 System Prompt（当 mode_name = "custom" 时生效，支持完全自定义）
 custom_system_prompt = ""
 
+[model]
+# DSH 智能体执行大模型配置（默认使用与当前 Web 实例一致的 gemini-3.7-flash-tiered）
+provider = "maiapi2"
+model = "gemini-3.7-flash-tiered"
+
 [plugin]
 enabled = true
 config_version = "0.1.0"

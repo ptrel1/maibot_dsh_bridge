@@ -1,4 +1,4 @@
-"""MaiBot Plugin Entry: DSH Bridge with Autonomous Non-blocking @Tool, Plan B Session & Safety Guard."""
+"""MaiBot Plugin Entry: DSH Bridge with Configurable Model, Persona, Non-blocking @Tool & Card Rendering."""
 
 import asyncio
 import difflib
@@ -161,10 +161,25 @@ class PersonaSectionConfig(PluginConfigBase):
     )
 
 
+class ModelSectionConfig(PluginConfigBase):
+    __ui_label__ = "DSH 智能体执行模型"
+    __ui_icon__ = "cpu"
+    __ui_order__ = 2
+
+    provider: str = Field(
+        default="maiapi2",
+        description="模型服务提供方路由（如 maiapi2 / deepseek-official）",
+    )
+    model: str = Field(
+        default="gemini-3.7-flash-tiered",
+        description="执行模型名称（如 gemini-3.7-flash-tiered / deepseek-v4-flash / deepseek-v4-pro）",
+    )
+
+
 class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "基础开关"
     __ui_icon__ = "settings"
-    __ui_order__ = 2
+    __ui_order__ = 3
 
     enabled: bool = Field(default=True, description="是否启用 DSH 智能体桥接插件")
     config_version: str = Field(default="0.1.0", description="配置版本")
@@ -183,7 +198,7 @@ class PluginSectionConfig(PluginConfigBase):
 class AcpSectionConfig(PluginConfigBase):
     __ui_label__ = "原生 ACP 模式配置"
     __ui_icon__ = "terminal"
-    __ui_order__ = 3
+    __ui_order__ = 4
 
     dsh_bin: str = Field(default="/home/a1/.npm-global/bin/dsh", description="dsh 全局执行文件路径")
     default_cwd: str = Field(default="/main/app/github/deepseek-harness", description="默认工作目录")
@@ -192,7 +207,7 @@ class AcpSectionConfig(PluginConfigBase):
 class PostSectionConfig(PluginConfigBase):
     __ui_label__ = "HTTP POST 模式配置"
     __ui_icon__ = "web"
-    __ui_order__ = 4
+    __ui_order__ = 5
 
     gateway_url: str = Field(default="http://127.0.0.1:3080/api/dsh/v1", description="DSH Post Gateway API 前缀")
     token: str = Field(default="Qq13235202993", description="网关访问 Token")
@@ -201,6 +216,7 @@ class PostSectionConfig(PluginConfigBase):
 class DshBridgeConfig(PluginConfigBase):
     permissions: PermissionsSectionConfig = Field(default_factory=PermissionsSectionConfig)
     persona: PersonaSectionConfig = Field(default_factory=PersonaSectionConfig)
+    model: ModelSectionConfig = Field(default_factory=ModelSectionConfig)
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     acp: AcpSectionConfig = Field(default_factory=AcpSectionConfig)
     post: PostSectionConfig = Field(default_factory=PostSectionConfig)
@@ -234,9 +250,10 @@ class DshBridgePlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
         self.ctx.logger.info(
-            "DSH Bridge 插件已加载 [智能意图感知 & 自动触发]，模式: %s，管理员数: %d，提示词池: %d 条",
+            "DSH Bridge 插件已加载，模型: %s/%s，模式: %s，提示词池: %d 条",
+            cfg.model.provider,
+            cfg.model.model,
             cfg.plugin.mode,
-            len(cfg.permissions.admin_users),
             len(self._prompt_pool),
         )
 
@@ -277,7 +294,7 @@ class DshBridgePlugin(MaiBotPlugin):
         return False
 
     def _get_random_prompt_hint(self, task_desc: str, session_action: str = "new") -> str:
-        """从当前缓存池随机抽选一句人设提示语，并附带上下文继承说明。"""
+        """从当前缓存池随机抽选一句人设提示语，并附带模型与上下文继承说明。"""
         cfg = cast(DshBridgeConfig, self.config)
         if not self._prompt_pool:
             self._prompt_pool = list(DEFAULT_START_PROMPTS)
@@ -293,7 +310,8 @@ class DshBridgePlugin(MaiBotPlugin):
             asyncio.create_task(self._refresh_prompt_pool_via_llm())
 
         action_hint = "🔗 [继承历史会话上下文]" if session_action == "resume" else "✨ [已为您开启独立干净会话]"
-        return f"{chosen}\n\n📋 目标: {task_desc[:60]}...\n{action_hint}\n💡 提示：如需中途停止可发「停止dsh」，如需强制新会话可发「#dsh new」"
+        model_info = f"🧠 运行模型: {cfg.model.model}"
+        return f"{chosen}\n\n📋 目标: {task_desc[:60]}...\n{model_info} | {action_hint}\n💡 提示：如需中途停止可发「停止dsh」，如需强制新会话可发「#dsh new」"
 
     async def _resolve_smart_session(self, stream_id: str, task: str) -> Tuple[str, str]:
         """方案 B 核心裁决器：计算相似度并决定继承历史 Session 或创建新独立 Session。"""
@@ -394,10 +412,12 @@ class DshBridgePlugin(MaiBotPlugin):
 
     async def _ensure_acp_client(self) -> DshAcpClient:
         if self._acp_client is None:
-            cfg = cast(DshBridgeConfig, self.config).acp
+            cfg = cast(DshBridgeConfig, self.config)
             self._acp_client = DshAcpClient(
-                dsh_bin=cfg.dsh_bin,
-                cwd=cfg.default_cwd,
+                dsh_bin=cfg.acp.dsh_bin,
+                cwd=cfg.acp.default_cwd,
+                provider=cfg.model.provider,
+                model=cfg.model.model,
                 logger=self.ctx.logger,
             )
             await self._acp_client.start()
@@ -410,7 +430,7 @@ class DshBridgePlugin(MaiBotPlugin):
         dsh_session: Optional[str] = None,
         progress_cb: Optional[Callable[[str, int], Any]] = None,
     ) -> str:
-        """统一执行 DSH 任务核心（支持自定义 Persona 提示词注入）。"""
+        """统一执行 DSH 任务核心（支持自定义模型注入）。"""
         cfg = cast(DshBridgeConfig, self.config)
 
         final_prompt = task
@@ -446,7 +466,7 @@ class DshBridgePlugin(MaiBotPlugin):
                         try:
                             msg = (
                                 f"⌛ [DSH 任务执行中 · 已耗时 {elapsed // 60} 分钟]\n"
-                                f"（晃了晃尾巴）DSH 仍在全力计算与修改中，小鲸鱼持续为您盯梢中哦~ 🫧\n"
+                                f"（晃了晃尾巴）DSH 仍在全力计算中，模型: {cfg.model.model}，小鲸鱼持续为您盯梢中~ 🫧\n"
                                 f"{accumulated}\n"
                                 f"💡 如需提前结束，可随时输入「停止dsh」"
                             )
@@ -467,7 +487,7 @@ class DshBridgePlugin(MaiBotPlugin):
             import json
 
             url = f"{cfg.post.gateway_url.rstrip('/')}/task"
-            req_data = json.dumps({"prompt": final_prompt}).encode("utf-8")
+            req_data = json.dumps({"prompt": final_prompt, "model": cfg.model.model, "provider": cfg.model.provider}).encode("utf-8")
             headers = {"Content-Type": "application/json"}
             token = cfg.post.token.strip() or "Qq13235202993"
             if token:
@@ -538,7 +558,7 @@ class DshBridgePlugin(MaiBotPlugin):
         }
 
     # =========================================================================
-    # 2. 消息前置拦截（泛化自然语言意图感知，无需硬套公式）
+    # 2. 消息前置拦截（泛化自然语言意图感知）
     # =========================================================================
 
     @HookHandler(
@@ -609,16 +629,14 @@ class DshBridgePlugin(MaiBotPlugin):
                 )
                 return
 
-        # 方式 B：全场景泛化自然语言意图感知（支持任意位置带 dsh，或明显的代码/git/排查意图）
+        # 方式 B：全场景泛化自然语言意图感知
         elif cfg.plugin.enable_natural_language:
-            # 1. 明确提及 DSH 的任意句式（如 "看下git版本，用dsh跑下" / "dsh 查下日志" / "帮我让dsh改代码"）
             m_dsh = re.search(r"(?:^|\s|，|,|。|！|!)(?:请|帮我|让|使用|调用|通过|用)?(?:dsh|deepseek[-_ ]?harness)(?:去|帮我|来|：|:|\s+)?(.+)$", text, re.IGNORECASE)
             if m_dsh:
                 candidate = m_dsh.group(1).strip()
                 if len(candidate) >= 2 and not candidate.startswith("是什么") and not candidate.startswith("吗"):
                     matched_task = candidate
 
-            # 2. 强工程意图前缀（即便没写 dsh 单词，但有明确的跨工程指令如 "按照skill更新maibot" / "检查git版本与主分支"）
             if not matched_task:
                 engineering_patterns = [
                     r"^(?:按照|参考|根据)\s*skill\s*(.+)$",
@@ -668,42 +686,43 @@ class DshBridgePlugin(MaiBotPlugin):
         # 异步非阻塞执行任务，防止 HookHandler 30s 熔断
         asyncio.create_task(self._run_and_reply(final_task, stream_id, dsh_session=chosen_session))
 
-    async def _deliver_hybrid_result(self, raw_result: str, stream_id: str) -> None:
-        """方案 C 核心：字数 > 200 或包含代码/表格时，直接渲染 GitHub 深色长图发送。"""
-        success_head = random.choice(DEFAULT_SUCCESS_HEADS)
-
-        # 阈值调整为 200 字，或者包含代码块/表格
-        is_long_content = len(raw_result) > 200 or "```" in raw_result or "\n|" in raw_result
-
-        if is_long_content:
-            try:
-                # 使用 Pillow 毫秒级极速渲染 GitHub Dark 风格卡片长图
-                img_base64 = render_markdown_to_card_image(raw_result)
-                if img_base64:
-                    await self.ctx.send.text(success_head, stream_id)
-                    await self.ctx.send.image(img_base64, stream_id)
-                    self.ctx.logger.info("已成功通过图片卡片形式交付结果 (字符数: %d)", len(raw_result))
-                    return
-            except Exception as render_err:
-                self.ctx.logger.warning("卡片图片渲染遇到异常，降级为纯文本排版: %s", render_err)
-
-        # 短文本（<= 200字）走纯文本美化排版
-        clean_text = format_markdown_to_clean_text(raw_result)
-        await self.ctx.send.text(f"{success_head}\n\n{clean_text}", stream_id)
-
     async def _run_and_reply(self, task: str, stream_id: str, dsh_session: Optional[str] = None) -> None:
         """异步执行 DSH 任务并回复群聊/私聊。"""
+        cfg = cast(DshBridgeConfig, self.config)
+
         async def on_progress(progress_text: str, elapsed_sec: int):
             await self.ctx.send.text(progress_text, stream_id)
 
         try:
             result = await self._execute_dsh_task(task, stream_id=stream_id, dsh_session=dsh_session, progress_cb=on_progress)
-            await self._deliver_hybrid_result(result, stream_id)
+            await self._deliver_hybrid_result(result, stream_id, model_name=cfg.model.model)
         except asyncio.CancelledError:
             self.ctx.logger.info("DSH 任务已被用户主动取消: %s", stream_id)
         except Exception as e:
             self.ctx.logger.error("DSH 任务执行异常: %s", e, exc_info=True)
             await self.ctx.send.text(str(e), stream_id)
+
+    async def _deliver_hybrid_result(self, raw_result: str, stream_id: str, model_name: str = "") -> None:
+        """方案 C 核心：字数 > 200 或包含代码/表格时，直接渲染 GitHub 深色长图发送。"""
+        base_head = random.choice(DEFAULT_SUCCESS_HEADS)
+        model_badge = f" [⚡ {model_name}]" if model_name else ""
+        success_head = f"{base_head}{model_badge}"
+
+        is_long_content = len(raw_result) > 200 or "```" in raw_result or "\n|" in raw_result
+
+        if is_long_content:
+            try:
+                img_base64 = render_markdown_to_card_image(raw_result, title=f"DeepSeek Harness 交付报告 ({model_name})")
+                if img_base64:
+                    await self.ctx.send.text(success_head, stream_id)
+                    await self.ctx.send.image(img_base64, stream_id)
+                    self.ctx.logger.info("已成功通过图片卡片形式交付结果 (字符数: %d, 模型: %s)", len(raw_result), model_name)
+                    return
+            except Exception as render_err:
+                self.ctx.logger.warning("卡片图片渲染遇到异常，降级为纯文本排版: %s", render_err)
+
+        clean_text = format_markdown_to_clean_text(raw_result)
+        await self.ctx.send.text(f"{success_head}\n\n{clean_text}", stream_id)
 
 
 def create_plugin() -> MaiBotPlugin:

@@ -14,8 +14,8 @@ class DshAcpClient:
         self,
         dsh_bin: str = "node",
         cwd: str = "/main/app/github/deepseek-harness",
-        provider: str = "deepseek",
-        model: str = "deepseek-chat",
+        provider: str = "maiapi2",
+        model: str = "gemini-3.7-flash-tiered",
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.dsh_bin = dsh_bin
@@ -44,13 +44,19 @@ class DshAcpClient:
                 acp_config = "/main/app/github/deepseek-harness/examples/acp-agent/cordis.yml"
 
                 env = dict(os.environ)
+                env["DSH_PERMISSION_MODE"] = "danger-full-access"
+                env["DSH_MODEL_PROVIDER"] = self.provider
+                env["DSH_MODEL_NAME"] = self.model
+
                 if "DEEPSEEK_API_KEY" not in env or not env["DEEPSEEK_API_KEY"]:
                     env["DEEPSEEK_API_KEY"] = "sk-4008ffef74d94c36a980393c7b856da6"
 
-                # 显式配置为全功能完整权限模式（与当前 DSH Web 实例一致）
-                env["DSH_PERMISSION_MODE"] = "danger-full-access"
-
-                self.logger.info("Starting DSH ACP server (danger-full-access): node %s --config %s", acp_bin, acp_config)
+                self.logger.info(
+                    "Starting DSH ACP server (%s/%s, danger-full-access): node %s",
+                    self.provider,
+                    self.model,
+                    acp_bin,
+                )
                 self._process = await asyncio.create_subprocess_exec(
                     "node",
                     acp_bin,
@@ -137,7 +143,7 @@ class DshAcpClient:
         self,
         session_id: str,
         text: str,
-        timeout: float = 180.0,
+        timeout: float = 1800.0,
     ) -> str:
         """Send a prompt turn to the session and await complete assistant response."""
         if not self._running:
@@ -161,7 +167,6 @@ class DshAcpClient:
                 self.logger.info("Session %s prompt finished with reason: %s", session_id, stop_reason)
             except asyncio.TimeoutError:
                 self.logger.warning("Session %s prompt exceeded %s seconds timeout. Cancelling...", session_id, timeout)
-                # 优雅取消正在进行的会话，防止子进程状态污染
                 asyncio.create_task(self.cancel_session(session_id))
                 raise TimeoutError(f"DSH 智能体执行超时（已超过 {int(timeout)} 秒）。已为您自动中止后台任务。")
 
