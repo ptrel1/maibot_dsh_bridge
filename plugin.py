@@ -11,6 +11,7 @@ from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
 from .acp_client import DshAcpClient
+from .formatter import build_github_dark_html, format_markdown_to_clean_text
 
 
 # =========================================================================
@@ -666,6 +667,43 @@ class DshBridgePlugin(MaiBotPlugin):
         # 异步非阻塞执行任务，防止 HookHandler 30s 熔断
         asyncio.create_task(self._run_and_reply(final_task, stream_id, dsh_session=chosen_session))
 
+    async def _deliver_hybrid_result(self, raw_result: str, stream_id: str) -> None:
+        """方案 C 核心：短文本走纯文本美化排版，长篇/大代码走 HTML 高清渲染图。"""
+        success_head = random.choice(DEFAULT_SUCCESS_HEADS)
+
+        # 判定条件：字符数超过 400 或 包含多行代码块/表格
+        is_long_content = len(raw_result) > 400 or "```" in raw_result or "\n|" in raw_result
+
+        if is_long_content:
+            try:
+                # 尝试调用 MaiBot 内置的 html_render_service 生成深色卡片图
+                from src.services.html_render_service import HtmlRenderRequest, get_html_render_service
+                renderer = get_html_render_service()
+                html_doc = build_github_dark_html(raw_result)
+
+                render_req = HtmlRenderRequest(
+                    html=html_doc,
+                    selector="body",
+                    viewport_width=850,
+                    viewport_height=600,
+                    device_scale_factor=2.0,
+                )
+                render_res = await renderer.render_html_to_image(render_req)
+
+                if render_res and render_res.image_base64:
+                    # 1. 发送成功抬头
+                    await self.ctx.send.text(success_head, stream_id)
+                    # 2. 发送高清长图
+                    await self.ctx.send.image(render_res.image_base64, stream_id)
+                    self.ctx.logger.info("已成功通过 HTML 渲染高清长图交付结果")
+                    return
+            except Exception as render_err:
+                self.ctx.logger.warning("HTML 转长图渲染遇到波动，平滑降级为纯文本排版: %s", render_err)
+
+        # 纯文本模式或长图降级
+        clean_text = format_markdown_to_clean_text(raw_result)
+        await self.ctx.send.text(f"{success_head}\n\n{clean_text}", stream_id)
+
     async def _run_and_reply(self, task: str, stream_id: str, dsh_session: Optional[str] = None) -> None:
         """异步执行 DSH 任务并回复群聊/私聊。"""
         async def on_progress(progress_text: str, elapsed_sec: int):
@@ -673,8 +711,7 @@ class DshBridgePlugin(MaiBotPlugin):
 
         try:
             result = await self._execute_dsh_task(task, stream_id=stream_id, dsh_session=dsh_session, progress_cb=on_progress)
-            success_head = random.choice(DEFAULT_SUCCESS_HEADS)
-            await self.ctx.send.text(f"{success_head}\n\n{result}", stream_id)
+            await self._deliver_hybrid_result(result, stream_id)
         except asyncio.CancelledError:
             self.ctx.logger.info("DSH 任务已被用户主动取消: %s", stream_id)
         except Exception as e:
