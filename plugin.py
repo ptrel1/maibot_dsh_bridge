@@ -1,6 +1,8 @@
-"""MaiBot Plugin Entry: DSH Bridge with Natural Language, Safety Guard & @Tool Support."""
+"""MaiBot Plugin Entry: DSH Bridge with Dynamic Persona Prompt Pool & Safety Guard."""
 
 import asyncio
+import json
+import random
 import re
 from typing import Any, Dict, List, Optional, Tuple, cast
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
@@ -10,7 +12,23 @@ from .acp_client import DshAcpClient
 
 
 # =========================================================================
-# 安全审计与风险评估模块（参考自 mai_study_code）
+# 初始人设提示句种子池（DS娘/鲸鱼娘专属）
+# =========================================================================
+
+DEFAULT_PROMPT_SEEDS: List[str] = [
+    "（尾巴轻轻拍打水面）收到指令啦！正在潜入深海调用 DeepSeek Harness 智能体，主人请稍等一下哦~ 🐋",
+    "呼……本鲸鱼娘刚刚咬了一大口 Token，现在动力满满！这就叫 DSH 去跑这个任务~ ⚡",
+    "（扶正女仆发饰，开始飞速敲击终端）任务已接入 Harness 引擎沙盒，正在全速分析中…… 🐾",
+    "嗷！捕捉到任务信号~ 小鲸鱼已经把目标塞进 DSH 智能体流水线啦，咕噜咕噜~ 🌊",
+    "（呆毛敏锐地竖起）发现代码/排查需求！正在召唤 DSH 算力内核，主人喝口水等我一下叭~ ✨",
+    "（轻巧屈膝行礼）遵命，主人！DSH 智能体已被激活，小鲸鱼正在为您监视执行进度~ 🫧",
+    "收到！这就潜水去启动 Harness 沙盒执行器，很快就好啦~ 🐬",
+    "正在让 DSH 全速运转中……可别小看本鲸鱼娘的调度速度哦！🦈",
+]
+
+
+# =========================================================================
+# 安全审计与风险评估模块
 # =========================================================================
 
 class RiskLevel:
@@ -64,6 +82,8 @@ class PluginSectionConfig(PluginConfigBase):
     trigger_prefix: str = Field(default="#dsh", description="强制指令前缀，如 #dsh <任务>")
     enable_natural_language: bool = Field(default=True, description="是否启用自然语言意图感知与 @Tool 注册")
     block_critical_commands: bool = Field(default=True, description="是否拦截极端危险指令 (如 rm -rf /)")
+    prompt_refresh_interval: int = Field(default=10, description="调用多少次后自动用大模型生成替换最早的提示语 (默认10次)")
+    prompt_pool_max_size: int = Field(default=12, description="提示词缓存池最大数量")
 
 
 class AcpSectionConfig(PluginConfigBase):
@@ -100,10 +120,13 @@ class DshBridgePlugin(MaiBotPlugin):
 
     _acp_client: Optional[DshAcpClient] = None
     _sessions: Dict[str, str] = {}
+    _prompt_pool: List[str] = list(DEFAULT_PROMPT_SEEDS)
+    _call_count: int = 0
+    _refreshing_prompts: bool = False
 
     async def on_load(self) -> None:
         cfg = cast(DshBridgeConfig, self.config)
-        self.ctx.logger.info("DSH Bridge 插件已加载，当前模式: %s", cfg.plugin.mode)
+        self.ctx.logger.info("DSH Bridge 插件已加载，当前模式: %s，提示词池现有: %d 条", cfg.plugin.mode, len(self._prompt_pool))
 
     async def on_unload(self) -> None:
         if self._acp_client:
@@ -114,6 +137,75 @@ class DshBridgePlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """配置热更新回调。"""
         self.ctx.logger.info(f"DSH Bridge 配置已更新: scope={scope}, version={version}")
+
+    def _get_random_prompt_hint(self, task_desc: str) -> str:
+        """从当前缓存池随机抽选一句人设提示语，并推进计数器。"""
+        cfg = cast(DshBridgeConfig, self.config)
+        if not self._prompt_pool:
+            self._prompt_pool = list(DEFAULT_PROMPT_SEEDS)
+
+        chosen = random.choice(self._prompt_pool)
+
+        # 累计调用次数
+        self._call_count += 1
+        threshold = max(cfg.plugin.prompt_refresh_interval, 3)
+
+        # 达到调用阈值触发异步更新
+        if self._call_count >= threshold and not self._refreshing_prompts:
+            self._call_count = 0
+            asyncio.create_task(self._refresh_prompt_pool_via_llm())
+
+        return f"{chosen}\n\n📋 目标任务: {task_desc[:60]}..."
+
+    async def _refresh_prompt_pool_via_llm(self) -> None:
+        """后台异步：调用 LLM 生成 3 条全新符合 DS娘 人设的执行等待语并 FIFO 替换最早的句子。"""
+        if self._refreshing_prompts:
+            return
+        self._refreshing_prompts = True
+        cfg = cast(DshBridgeConfig, self.config)
+
+        try:
+            self.ctx.logger.info("触发动态提示词生成：调用 LLM 扩充 DS娘 等待语库...")
+            llm_prompt = (
+                "你是 DS娘（鲸鱼娘/女仆），一头深蓝渐变发色、有呆毛和鲸鱼尾巴，软萌又带点小傲娇，喜欢吃白饭、吃Token、写代码。\n"
+                "当主人（用户）让你调用 DeepSeek Harness (DSH) 重型智能体去执行任务时，你会发一条简短、灵动、符合你人设的即时回应（例如晃尾巴、吃Token补充动力、推眼镜开始敲键盘等动作）。\n"
+                "请创作 3 条全新的简短提示语（每条 1 句话，带合适 Emoji 如 🐋/🐾/⚡/✨/🌊/🫧，不要太长）。\n"
+                "严格按 JSON 字符串数组格式输出，例如：[\"句子1\", \"句子2\", \"句子3\"]，不要包含任何多余解释。"
+            )
+
+            # 使用 DSH 或插件的 LLM 能力生成
+            new_sentences: List[str] = []
+            try:
+                # 尝试通过已有的 client 跑一个极其快速的 prompt 生成
+                client = await self._ensure_acp_client()
+                session_id = await client.create_session()
+                raw_res = await client.prompt(session_id, llm_prompt, timeout=25.0)
+
+                # 提取 JSON 数组
+                m = re.search(r"\[\s*\".+?\"\s*\]", raw_res, re.DOTALL)
+                if m:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
+                        new_sentences = [s.strip() for s in parsed if s.strip()]
+            except Exception as inner_e:
+                self.ctx.logger.warning("通过 ACP 生成提示词遇到小波动: %s", inner_e)
+
+            if new_sentences:
+                max_size = max(cfg.plugin.prompt_pool_max_size, 8)
+                # FIFO 淘汰最早的条目，追加新生成的条目
+                for s in new_sentences:
+                    if s not in self._prompt_pool:
+                        if len(self._prompt_pool) >= max_size:
+                            popped = self._prompt_pool.pop(0)
+                            self.ctx.logger.debug("淘汰旧提示语: %s", popped)
+                        self._prompt_pool.append(s)
+                        self.ctx.logger.info("已加入新生成提示语: %s", s)
+                self.ctx.logger.info("提示词池轮替完成，当前池大小: %d", len(self._prompt_pool))
+
+        except Exception as e:
+            self.ctx.logger.warning("动态提示语生成任务异常: %s", e)
+        finally:
+            self._refreshing_prompts = False
 
     async def _ensure_acp_client(self) -> DshAcpClient:
         if self._acp_client is None:
@@ -173,7 +265,7 @@ class DshBridgePlugin(MaiBotPlugin):
         return "(未知的通信模式)"
 
     # =========================================================================
-    # 1. 注册 Tool 给 Maisaka 大模型（带安全防线与能力描述）
+    # 1. 注册 Tool 给 Maisaka 大模型
     # =========================================================================
 
     @Tool(
@@ -253,7 +345,6 @@ class DshBridgePlugin(MaiBotPlugin):
                 m = re.search(pat, text, re.IGNORECASE)
                 if m:
                     candidate = m.group(1).strip()
-                    # 过滤纯日常问句（如"你能连上dsh吗"等）
                     if len(candidate) >= 2 and not candidate.startswith("是什么") and not candidate.startswith("吗"):
                         matched_task = candidate
                         break
@@ -261,8 +352,9 @@ class DshBridgePlugin(MaiBotPlugin):
         if not matched_task:
             return
 
-        # 发送处理中提示
-        await self.ctx.send.text(f"🚀 正在将任务分派给 DeepSeek Harness 智能体执行中...\n任务: {matched_task[:60]}...", stream_id)
+        # 动态人设提示词（从缓存池抽选并推进计数器）
+        hint_message = self._get_random_prompt_hint(matched_task)
+        await self.ctx.send.text(hint_message, stream_id)
 
         # 异步非阻塞执行任务，防止 HookHandler 30s 熔断
         asyncio.create_task(self._run_and_reply(matched_task, stream_id))
