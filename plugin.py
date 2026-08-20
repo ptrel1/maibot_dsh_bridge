@@ -11,7 +11,8 @@ from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
 from .acp_client import DshAcpClient
-from .formatter import build_github_dark_html, format_markdown_to_clean_text
+from .formatter import format_markdown_to_clean_text
+from .image_renderer import render_markdown_to_card_image
 
 
 # =========================================================================
@@ -668,39 +669,25 @@ class DshBridgePlugin(MaiBotPlugin):
         asyncio.create_task(self._run_and_reply(final_task, stream_id, dsh_session=chosen_session))
 
     async def _deliver_hybrid_result(self, raw_result: str, stream_id: str) -> None:
-        """方案 C 核心：短文本走纯文本美化排版，长篇/大代码走 HTML 高清渲染图。"""
+        """方案 C 核心：字数 > 200 或包含代码/表格时，直接渲染 GitHub 深色长图发送。"""
         success_head = random.choice(DEFAULT_SUCCESS_HEADS)
 
-        # 判定条件：字符数超过 400 或 包含多行代码块/表格
-        is_long_content = len(raw_result) > 400 or "```" in raw_result or "\n|" in raw_result
+        # 阈值调整为 200 字，或者包含代码块/表格
+        is_long_content = len(raw_result) > 200 or "```" in raw_result or "\n|" in raw_result
 
         if is_long_content:
             try:
-                # 尝试调用 MaiBot 内置的 html_render_service 生成深色卡片图
-                from src.services.html_render_service import HtmlRenderRequest, get_html_render_service
-                renderer = get_html_render_service()
-                html_doc = build_github_dark_html(raw_result)
-
-                render_req = HtmlRenderRequest(
-                    html=html_doc,
-                    selector="body",
-                    viewport_width=850,
-                    viewport_height=600,
-                    device_scale_factor=2.0,
-                )
-                render_res = await renderer.render_html_to_image(render_req)
-
-                if render_res and render_res.image_base64:
-                    # 1. 发送成功抬头
+                # 使用 Pillow 毫秒级极速渲染 GitHub Dark 风格卡片长图
+                img_base64 = render_markdown_to_card_image(raw_result)
+                if img_base64:
                     await self.ctx.send.text(success_head, stream_id)
-                    # 2. 发送高清长图
-                    await self.ctx.send.image(render_res.image_base64, stream_id)
-                    self.ctx.logger.info("已成功通过 HTML 渲染高清长图交付结果")
+                    await self.ctx.send.image(img_base64, stream_id)
+                    self.ctx.logger.info("已成功通过图片卡片形式交付结果 (字符数: %d)", len(raw_result))
                     return
             except Exception as render_err:
-                self.ctx.logger.warning("HTML 转长图渲染遇到波动，平滑降级为纯文本排版: %s", render_err)
+                self.ctx.logger.warning("卡片图片渲染遇到异常，降级为纯文本排版: %s", render_err)
 
-        # 纯文本模式或长图降级
+        # 短文本（<= 200字）走纯文本美化排版
         clean_text = format_markdown_to_clean_text(raw_result)
         await self.ctx.send.text(f"{success_head}\n\n{clean_text}", stream_id)
 
