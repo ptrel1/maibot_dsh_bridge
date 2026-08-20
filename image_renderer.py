@@ -1,4 +1,4 @@
-"""High-Performance, Retina HD Markdown Card Image Renderer using Pillow with True CJK Fonts."""
+"""High-Performance, Retina HD Markdown Card Image Renderer using Pillow with True CJK Fonts & Emoji Sanitizer."""
 
 import base64
 import io
@@ -8,8 +8,54 @@ from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont
 
 
+# =========================================================================
+# Emoji 替换字典：将纯矢量 CJK 字体中缺失的 Emoji 替换为精美文本符号/中文标签
+# =========================================================================
+
+EMOJI_REPLACEMENTS: Dict[str, str] = {
+    "⚠️": "[!]",
+    "⚠": "[!]",
+    "⚡": "[*]",
+    "🐋": "[DS]",
+    "🐾": "[+]",
+    "🌊": "[~]",
+    "✨": "[*]",
+    "🫧": "[o]",
+    "🐬": "[DS]",
+    "🦈": "[DS]",
+    "⏱️": "[时]",
+    "⏱": "[时]",
+    "⌛": "[时]",
+    "💡": "[提示]",
+    "🛡️": "[安全]",
+    "🛡": "[安全]",
+    "🧠": "[AI]",
+    "📄": "[DOC]",
+    "🔌": "[API]",
+    "🎉": "[OK]",
+    "🛑": "[STOP]",
+    "🧹": "[CLEAN]",
+    "📊": "[统计]",
+    "🔗": "[LINK]",
+    "•": "·",
+}
+
+
+def sanitize_text_for_cjk(text: str) -> str:
+    """清理并替换文本中超出普通 CJK 矢量字体字形库的 Emoji 特殊符号，杜绝豆腐块方块口。"""
+    if not text:
+        return ""
+    res = text
+    for em, rep in EMOJI_REPLACEMENTS.items():
+        res = res.replace(em, rep)
+    
+    # 将其余未知的 4 字节高位 Unicode Emoji 符号安全清理
+    res = re.sub(r"[\U00010000-\U0010ffff]", "", res)
+    return res
+
+
 def _load_cjk_fonts() -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
-    """智能查找系统中可用的真实中文字体（避免回退到默认点阵字体导致方块口口口）。"""
+    """智能查找系统中可用的真实中文字体。"""
     font_candidates = [
         "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
         "/usr/local/share/fonts/华/华康圆体W7.ttf",
@@ -24,7 +70,6 @@ def _load_cjk_fonts() -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
             valid_font = cand
             break
 
-    # 视网膜 Retina 2x 高清字号
     if valid_font:
         try:
             f_title = ImageFont.truetype(valid_font, 36)
@@ -47,9 +92,8 @@ def render_markdown_to_card_image(
     title: str = "DeepSeek Harness 交付报告",
     stats_meta: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """使用 Pillow 原生离线渲染 Retina 2x 超清 GitHub/VSCode 深色卡片长图。"""
+    """使用 Pillow 原生离线渲染 Retina 2x 超清深色卡片长图（自动消毒 Emoji 杜绝方块口）。"""
     try:
-        # Retina 2x 画布宽度（1300px 宽度，超高清呈现）
         width = 1300
         padding = 48
         line_spacing = 10
@@ -68,8 +112,9 @@ def render_markdown_to_card_image(
         c_quote_bar = (56, 139, 253)  # #388bfd
         c_badge_bg = (33, 38, 45)     # #21262d
 
-        # 文本解析
-        raw_lines = md_text.split("\n")
+        # 清洗正文中的高位 Emoji
+        clean_md = sanitize_text_for_cjk(md_text)
+        raw_lines = clean_md.split("\n")
         render_items: List[Tuple[str, str, Any]] = []
         in_code = False
 
@@ -93,7 +138,7 @@ def render_markdown_to_card_image(
             elif sline.startswith("> "):
                 render_items.append(("quote", sline[2:].strip(), f_body))
             elif sline.startswith("- ") or sline.startswith("* "):
-                render_items.append(("list", "• " + sline[2:].strip(), f_body))
+                render_items.append(("list", "· " + sline[2:].strip(), f_body))
             elif sline.strip() == "---" or sline.strip() == "***":
                 render_items.append(("divider", "", f_body))
             elif not sline.strip():
@@ -101,7 +146,7 @@ def render_markdown_to_card_image(
             else:
                 render_items.append(("text", sline.strip(), f_body))
 
-        # 计算总高度 (2x 比例计算)
+        # 计算总高度
         y_cursor = padding + 90
         for itype, itext, ifont in render_items:
             if itype == "spacer":
@@ -130,8 +175,8 @@ def render_markdown_to_card_image(
         # 绘制主卡片底色与边框
         draw.rounded_rectangle([padding // 2, padding // 2, width - padding // 2, total_h - padding // 2], radius=16, fill=c_card, outline=c_border, width=2)
 
-        # 头部专属 Logo
-        draw.text((padding + 12, padding + 12), "🐋 DS娘 x DeepSeek Harness", font=f_title, fill=c_primary)
+        # 头部 Logo
+        draw.text((padding + 12, padding + 12), "◆ DS娘 x DeepSeek Harness", font=f_title, fill=c_primary)
         draw.text((width - padding - 180, padding + 20), "智能体执行交付", font=f_small, fill=c_muted)
         draw.line([padding + 12, padding + 66, width - padding - 12, padding + 66], fill=c_border, width=2)
 
@@ -151,7 +196,7 @@ def render_markdown_to_card_image(
                 y += 40
             elif itype == "code_fence":
                 draw.rounded_rectangle([padding + 6, y, width - padding - 6, y + 30], radius=6, fill=(30, 36, 44))
-                draw.text((padding + 18, y + 4), f"📄 {itext or 'CODE'}", font=f_small, fill=c_muted)
+                draw.text((padding + 18, y + 4), f"[DOC] {itext or 'CODE'}", font=f_small, fill=c_muted)
                 y += 36
             elif itype == "code_end":
                 y += 12
@@ -174,26 +219,26 @@ def render_markdown_to_card_image(
                     y += 36
                 y += line_spacing
 
-        # 底部状态栏（Retina 2x 徽章）
+        # 底部状态栏
         footer_y = total_h - padding - 54
         if stats_meta:
             draw.line([padding + 12, footer_y - 12, width - padding - 12, footer_y - 12], fill=c_border, width=2)
             
             badges = []
             if stats_meta.get("model"):
-                badges.append(f"⚡ {stats_meta['model']}")
+                badges.append(f"[*] {stats_meta['model']}")
             if stats_meta.get("elapsed"):
-                badges.append(f"⏱️ 耗时 {stats_meta['elapsed']}")
+                badges.append(f"[时] 耗时 {stats_meta['elapsed']}")
             if stats_meta.get("mode"):
-                badges.append(f"🔌 {stats_meta['mode'].upper()}")
-            badges.append("🛡️ 沙盒全放行")
-            badges.append("🧠 D老师模式")
+                badges.append(f"[API] {stats_meta['mode'].upper()}")
+            badges.append("[+] 沙盒全放行")
+            badges.append("[*] D老师模式")
 
             bx = padding + 12
             for badge_text in badges:
                 bw = len(badge_text) * 16 + 24
                 draw.rounded_rectangle([bx, footer_y, bx + bw, footer_y + 34], radius=17, fill=c_badge_bg, outline=c_border, width=1)
-                draw.text((bx + 12, footer_y + 5), badge_text, font=f_badge, fill=c_primary if "⚡" in badge_text else c_text)
+                draw.text((bx + 12, footer_y + 5), badge_text, font=f_badge, fill=c_primary if "[*]" in badge_text else c_text)
                 bx += bw + 12
 
             footer_y += 42
