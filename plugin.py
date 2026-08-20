@@ -12,10 +12,10 @@ from .acp_client import DshAcpClient
 
 
 # =========================================================================
-# 初始人设提示句种子池（DS娘/鲸鱼娘专属）
+# 初始人设提示句与交付/异常语气种子池（DS娘/鲸鱼娘专属）
 # =========================================================================
 
-DEFAULT_PROMPT_SEEDS: List[str] = [
+DEFAULT_START_PROMPTS: List[str] = [
     "（尾巴轻轻拍打水面）收到指令啦！正在潜入深海调用 DeepSeek Harness 智能体，主人请稍等一下哦~ 🐋",
     "呼……本鲸鱼娘刚刚咬了一大口 Token，现在动力满满！这就叫 DSH 去跑这个任务~ ⚡",
     "（扶正女仆发饰，开始飞速敲击终端）任务已接入 Harness 引擎沙盒，正在全速分析中…… 🐾",
@@ -24,6 +24,19 @@ DEFAULT_PROMPT_SEEDS: List[str] = [
     "（轻巧屈膝行礼）遵命，主人！DSH 智能体已被激活，小鲸鱼正在为您监视执行进度~ 🫧",
     "收到！这就潜水去启动 Harness 沙盒执行器，很快就好啦~ 🐬",
     "正在让 DSH 全速运转中……可别小看本鲸鱼娘的调度速度哦！🦈",
+]
+
+DEFAULT_SUCCESS_HEADS: List[str] = [
+    "✨（晃了晃鲸鱼尾巴）DSH 智能体已经顺利把任务搞定啦！交付结果如下：",
+    "🎉 呼……任务执行完毕！本鲸鱼娘已经把 DSH 的最终分析整理好啦：",
+    "🐬 报告主人！Harness 沙盒执行完毕，快来看看新鲜出炉的交付内容叭~",
+    "✨ 深度思考与执行完成！这是 DSH 智能体为您生成的完整报告：",
+]
+
+DEFAULT_ERROR_HEADS: List[str] = [
+    "呜哇……（尾巴沮丧地垂下来）DSH 智能体在执行途中遇到了一点异常：",
+    "QAQ 抱歉主人，这次召唤 DSH 好像碰到了小麻烦：",
+    "（呆毛耷拉下来）呜……任务执行时抛出了异常：",
 ]
 
 
@@ -120,7 +133,7 @@ class DshBridgePlugin(MaiBotPlugin):
 
     _acp_client: Optional[DshAcpClient] = None
     _sessions: Dict[str, str] = {}
-    _prompt_pool: List[str] = list(DEFAULT_PROMPT_SEEDS)
+    _prompt_pool: List[str] = list(DEFAULT_START_PROMPTS)
     _call_count: int = 0
     _refreshing_prompts: bool = False
 
@@ -142,7 +155,7 @@ class DshBridgePlugin(MaiBotPlugin):
         """从当前缓存池随机抽选一句人设提示语，并推进计数器。"""
         cfg = cast(DshBridgeConfig, self.config)
         if not self._prompt_pool:
-            self._prompt_pool = list(DEFAULT_PROMPT_SEEDS)
+            self._prompt_pool = list(DEFAULT_START_PROMPTS)
 
         chosen = random.choice(self._prompt_pool)
 
@@ -173,15 +186,12 @@ class DshBridgePlugin(MaiBotPlugin):
                 "严格按 JSON 字符串数组格式输出，例如：[\"句子1\", \"句子2\", \"句子3\"]，不要包含任何多余解释。"
             )
 
-            # 使用 DSH 或插件的 LLM 能力生成
             new_sentences: List[str] = []
             try:
-                # 尝试通过已有的 client 跑一个极其快速的 prompt 生成
                 client = await self._ensure_acp_client()
                 session_id = await client.create_session()
                 raw_res = await client.prompt(session_id, llm_prompt, timeout=25.0)
 
-                # 提取 JSON 数组
                 m = re.search(r"\[\s*\".+?\"\s*\]", raw_res, re.DOTALL)
                 if m:
                     parsed = json.loads(m.group(0))
@@ -192,7 +202,6 @@ class DshBridgePlugin(MaiBotPlugin):
 
             if new_sentences:
                 max_size = max(cfg.plugin.prompt_pool_max_size, 8)
-                # FIFO 淘汰最早的条目，追加新生成的条目
                 for s in new_sentences:
                     if s not in self._prompt_pool:
                         if len(self._prompt_pool) >= max_size:
@@ -222,12 +231,12 @@ class DshBridgePlugin(MaiBotPlugin):
         """统一执行 DSH 任务核心。"""
         cfg = cast(DshBridgeConfig, self.config)
 
-        # 安全防线拦截
+        # 安全防线拦截（融入 DS娘 人设）
         if cfg.plugin.block_critical_commands:
             risk_level, reason = evaluate_task_safety(task)
             if risk_level == RiskLevel.CRITICAL:
                 self.ctx.logger.warning(f"DSH 指令被安全防线拦截: {reason}")
-                return f"🛡️ [安全防线拦截] 拒绝执行高危操作：{reason}"
+                return f"🛡️ 呜哇！主人，这条指令太危险啦（检测到：{reason}）！本鲸鱼娘的防线不能让它摧毁系统哦，已为您安全拦截~"
 
         if cfg.plugin.mode == "acp":
             client = await self._ensure_acp_client()
@@ -260,9 +269,9 @@ class DshBridgePlugin(MaiBotPlugin):
                     return json.loads(resp.read().decode("utf-8"))
 
             resp_json = await loop.run_in_executor(None, do_post)
-            return resp_json.get("output", resp_json.get("result", "(无返回结果)"))
+            return resp_json.get("output", resp_json.get("result", "(任务执行完成，暂无输出文本)"))
 
-        return "(未知的通信模式)"
+        return "(未知的通信模式，请检查插件配置)"
 
     # =========================================================================
     # 1. 注册 Tool 给 Maisaka 大模型
@@ -289,7 +298,7 @@ class DshBridgePlugin(MaiBotPlugin):
         """Maisaka 模型调用 DSH 工具回调。"""
         del kwargs
         if not task.strip():
-            return {"name": "dsh_execute_task", "content": "任务内容为空"}
+            return {"name": "dsh_execute_task", "content": "任务内容不能为空哦~"}
 
         self.ctx.logger.info("Maisaka 模型主动调用 DSH 工具: %s", task)
         try:
@@ -297,7 +306,7 @@ class DshBridgePlugin(MaiBotPlugin):
             return {"name": "dsh_execute_task", "content": result}
         except Exception as e:
             self.ctx.logger.error("DSH Tool 执行异常: %s", e)
-            return {"name": "dsh_execute_task", "content": f"DSH 执行失败: {e}"}
+            return {"name": "dsh_execute_task", "content": f"DSH 执行遇到异常: {e}"}
 
     # =========================================================================
     # 2. 消息前置拦截（支持 #dsh 前缀与自然语言意图快速唤起）
@@ -329,7 +338,7 @@ class DshBridgePlugin(MaiBotPlugin):
             matched_task = text[len(prefix):].strip()
             if not matched_task:
                 await self.ctx.send.text(
-                    f"🤖 DeepSeek Harness 指令格式：\n{prefix} <你的任务描述/代码需求/排查目标>",
+                    f"🐾 DS娘提醒您，指令格式是这样哒：\n{prefix} <你的任务描述/代码需求/排查目标>",
                     stream_id,
                 )
                 return
@@ -363,10 +372,10 @@ class DshBridgePlugin(MaiBotPlugin):
         """异步执行 DSH 任务并回复群聊/私聊。"""
         try:
             result = await self._execute_dsh_task(task, stream_id=stream_id)
-            await self.ctx.send.text(f"✨ DeepSeek Harness 任务交付结果：\n\n{result}", stream_id)
+            await self.ctx.send.text(result, stream_id)
         except Exception as e:
             self.ctx.logger.error("DSH 任务执行异常: %s", e, exc_info=True)
-            await self.ctx.send.text(f"❌ DSH 任务执行失败: {e}", stream_id)
+            await self.ctx.send.text(str(e), stream_id)
 
 
 def create_plugin() -> MaiBotPlugin:
