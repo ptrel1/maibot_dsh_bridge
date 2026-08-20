@@ -47,7 +47,10 @@ class DshAcpClient:
                 if "DEEPSEEK_API_KEY" not in env or not env["DEEPSEEK_API_KEY"]:
                     env["DEEPSEEK_API_KEY"] = "sk-4008ffef74d94c36a980393c7b856da6"
 
-                self.logger.info("Starting DSH ACP server: node %s --config %s", acp_bin, acp_config)
+                # 显式配置为全功能完整权限模式（与当前 DSH Web 实例一致）
+                env["DSH_PERMISSION_MODE"] = "danger-full-access"
+
+                self.logger.info("Starting DSH ACP server (danger-full-access): node %s --config %s", acp_bin, acp_config)
                 self._process = await asyncio.create_subprocess_exec(
                     "node",
                     acp_bin,
