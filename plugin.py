@@ -14,6 +14,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用 DSH 智能体桥接插件")
+    config_version: str = Field(default="0.1.0", description="配置版本")
     mode: str = Field(default="acp", description="通信模式: acp (原生stdio进程) 或 post (HTTP网关)")
     trigger_prefix: str = Field(default="#dsh", description="触发指令前缀，如 #dsh <任务描述>")
 
@@ -60,6 +61,10 @@ class DshBridgePlugin(MaiBotPlugin):
             await self._acp_client.stop()
             self._acp_client = None
         self.ctx.logger.info("DSH Bridge 插件已卸载")
+
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
+        """配置热更新回调。"""
+        self.ctx.logger.info(f"DSH Bridge 配置已更新: scope={scope}, version={version}")
 
     async def _init_acp(self) -> None:
         cfg = cast(DshBridgeConfig, self.config).acp
@@ -146,3 +151,9 @@ class DshBridgePlugin(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.error("DSH 任务执行异常: %s", e, exc_info=True)
             await self.ctx.send.text(f"❌ DSH 任务执行失败: {e}", stream_id)
+
+
+def create_plugin() -> MaiBotPlugin:
+    """Plugin factory export for MaiBot 1.2+."""
+    return DshBridgePlugin()
+

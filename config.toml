@@ -1,0 +1,14 @@
+[plugin]
+enabled = true
+config_version = "0.1.0"
+mode = "acp"
+trigger_prefix = "#dsh"
+
+[acp]
+dsh_bin = "/home/a1/.npm-global/bin/dsh"
+default_cwd = "/main/app/github/deepseek-harness"
+timeout = 180.0
+
+[post]
+gateway_url = "http://127.0.0.1:3080/api/dsh/v1"
+token = ""
