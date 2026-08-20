@@ -9,25 +9,16 @@ from typing import Any, Dict, List, Optional
 
 
 def resolve_dsh_home() -> str:
-    """自动动态探测并定位有效的 DSH_HOME 目录，杜绝硬编码。
-    
-    优先级：
-    1. 现有环境变量 DSH_HOME；
-    2. 当前用户 HOME 目录 (~/.dsh)；
-    3. 系统常见用户目录 (/home/*/.dsh) 中含有 settings.yaml 的有效目录；
-    4. /root/.dsh。
-    """
+    """自动动态探测并定位有效的 DSH_HOME 目录。"""
     if os.environ.get("DSH_HOME"):
         cand = Path(os.environ["DSH_HOME"])
         if cand.exists():
             return str(cand)
 
-    # 检查当前用户 HOME
     home = Path.home() / ".dsh"
     if (home / "settings.yaml").exists():
         return str(home)
 
-    # 若为 root 运行，自动扫描 /home 下各用户的 .dsh 真实有效配置
     home_parent = Path("/home")
     if home_parent.exists():
         try:
@@ -39,7 +30,6 @@ def resolve_dsh_home() -> str:
         except Exception:
             pass
 
-    # 兜底
     if home.exists():
         return str(home)
     return str(Path.home() / ".dsh")
@@ -65,7 +55,7 @@ class DshAcpClient:
         self._process: Optional[asyncio.subprocess.Process] = None
         self._req_id: int = 0
         self._pending_requests: Dict[int, asyncio.Future] = {}
-        self._session_listeners: Dict[str, asyncio.Queue] = {}
+        self._session_listeners: Dict[str, List[str]] = {}
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
@@ -82,7 +72,6 @@ class DshAcpClient:
                 acp_config = "/main/app/github/deepseek-harness/examples/acp-agent/cordis.yml"
 
                 env = dict(os.environ)
-                # 动态自适应探测 DSH_HOME
                 dsh_home_path = resolve_dsh_home()
                 env["DSH_HOME"] = dsh_home_path
                 env["DSH_PERMISSION_MODE"] = "danger-full-access"
@@ -114,7 +103,6 @@ class DshAcpClient:
                 self._reader_task = asyncio.create_task(self._read_loop())
                 self._stderr_task = asyncio.create_task(self._stderr_loop())
 
-                # Step 1: Handshake initialize
                 init_res = await self._send_request(
                     "initialize",
                     {
@@ -194,8 +182,9 @@ class DshAcpClient:
         if not self._running:
             await self.start()
 
-        queue: asyncio.Queue = asyncio.Queue()
-        self._session_listeners[session_id] = queue
+        # 维护一个累加列表，收集属于该 session_id 的所有流式文本
+        chunks_list: List[str] = []
+        self._session_listeners[session_id] = chunks_list
 
         try:
             prompt_fut = self._send_request(
@@ -209,19 +198,17 @@ class DshAcpClient:
             try:
                 res = await asyncio.wait_for(prompt_fut, timeout=timeout)
                 stop_reason = res.get("stopReason", "end_turn")
-                self.logger.info("Session %s prompt finished with reason: %s", session_id, stop_reason)
+                self.logger.info("Session %s prompt finished with reason: %s, chunks count: %d", session_id, stop_reason, len(chunks_list))
             except asyncio.TimeoutError:
                 self.logger.warning("Session %s prompt exceeded %s seconds timeout. Cancelling...", session_id, timeout)
                 asyncio.create_task(self.cancel_session(session_id))
                 raise TimeoutError(f"DSH 智能体执行超时（已超过 {int(timeout)} 秒）。已为您自动中止后台任务。")
 
-            chunks = []
-            while not queue.empty():
-                item = queue.get_nowait()
-                if isinstance(item, str):
-                    chunks.append(item)
+            # 等待微小窗口期确保所有流式 chunk 均已投递
+            if not chunks_list:
+                await asyncio.sleep(0.2)
 
-            final_text = "".join(chunks).strip()
+            final_text = "".join(chunks_list).strip()
             if not final_text:
                 final_text = "(任务已执行完成，无文本输出)"
             return final_text
@@ -301,7 +288,7 @@ class DshAcpClient:
                         content = update.get("content", {})
                         chunk = content.get("text", "") if isinstance(content, dict) else str(content)
                         if sess_id in self._session_listeners:
-                            self._session_listeners[sess_id].put_nowait(chunk)
+                            self._session_listeners[sess_id].append(chunk)
 
                 elif method == "session/request_permission":
                     req_id = data.get("id")
