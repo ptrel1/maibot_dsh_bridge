@@ -44,6 +44,7 @@ class DshAcpClient:
                 acp_config = "/main/app/github/deepseek-harness/examples/acp-agent/cordis.yml"
 
                 env = dict(os.environ)
+                env["DSH_HOME"] = "/home/a1/.dsh"
                 env["DSH_PERMISSION_MODE"] = "danger-full-access"
                 env["DSH_MODEL_PROVIDER"] = self.provider
                 env["DSH_MODEL_NAME"] = self.model
