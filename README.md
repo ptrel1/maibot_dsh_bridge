@@ -9,7 +9,7 @@
 - **双通信模式支持**：
   - 🔵 **HTTP POST 模式（推荐，直接复用当前运行中的 DSH 3080 实例）**：
     - 直接向本地或远程运行中的 DSH Web 发送请求，复用当前已配置的自定义模型（如 `gemini-3.7-flash-tiered`）、已装插件与鉴权凭据，零额外子进程开销！
-    - **前置要求**：目标 DSH 需安装 [`dsh-post-gateway`](https://github.com/ptrel1/dsh-post-gateway) 插件。
+    - **前置要求**：目标 DSH 需安装 [`dsh-postapi-bridge`](https://github.com/ptrel1/dsh-postapi-bridge) 插件。
   - 🟢 **原生 ACP 模式（单机独立子进程）**：
     - 麦麦直接拉起 `dsh --profile acp` 子进程，通过标准 JSON-RPC stdio 管道进行通信。
 - **全场景自然语言意图感知**：
@@ -39,9 +39,9 @@
 1. **在 DSH 服务端安装网关插件**：
    ```bash
    # 在运行 DSH 的环境中执行
-   dsh plugin --profile web add link:/path/to/dsh-post-gateway
+   dsh plugin --profile web add link:/path/to/dsh-postapi-bridge
    # 或通过 GitHub 安装
-   dsh plugin --profile web add github:ptrel1/dsh-post-gateway#main
+   dsh plugin --profile web add github:ptrel1/dsh-postapi-bridge#main
    ```
 2. **在麦麦端配置 `config.toml`**：
    ```toml
