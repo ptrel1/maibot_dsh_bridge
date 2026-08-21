@@ -506,6 +506,13 @@ class DshBridgePlugin(MaiBotPlugin):
         if cfg.persona.mode_name == "custom" and cfg.persona.custom_system_prompt.strip():
             custom_head = cfg.persona.custom_system_prompt.strip()
             final_prompt = f"【系统指令】\n{custom_head}\n\n【用户任务】\n{task}"
+        else:
+            final_prompt = (
+                f"【用户具体任务】\n{task}\n\n"
+                "【严格回答约束】\n"
+                "1. 使用 bash/read 等工具实际执行并检查真实目标（如涉及 git 状态、日志分析、文件排查），获取第一手事实；\n"
+                "2. 最终回复必须直接、清晰地回答用户所提问的具体任务目标，直接给出分析结论与数据，严禁答非所问，严禁生成无关的架构图或流程图。"
+            )
 
         if cfg.plugin.mode == "acp":
             client = await self._ensure_acp_client()
