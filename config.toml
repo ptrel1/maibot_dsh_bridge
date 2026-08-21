@@ -16,7 +16,7 @@ model = "gemini-3.7-flash-tiered"
 [plugin]
 enabled = true
 config_version = "0.1.0"
-mode = "acp"
+mode = "post"
 trigger_prefix = "#dsh"
 enable_natural_language = true
 block_critical_commands = true
