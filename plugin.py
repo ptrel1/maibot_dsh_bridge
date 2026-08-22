@@ -221,8 +221,8 @@ class AcpSectionConfig(PluginConfigBase):
     __ui_icon__ = "terminal"
     __ui_order__ = 4
 
-    dsh_bin: str = Field(default="/home/a1/.npm-global/bin/dsh", description="dsh 全局执行文件路径")
-    default_cwd: str = Field(default="/main/app/github/deepseek-harness", description="默认工作目录")
+    dsh_bin: str = Field(default="dsh", description="dsh 全局执行文件路径")
+    default_cwd: str = Field(default=".", description="默认工作目录")
 
 
 class PostSectionConfig(PluginConfigBase):

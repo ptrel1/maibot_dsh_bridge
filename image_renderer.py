@@ -65,14 +65,16 @@ def get_rendered_emoji_sprite(char: str, target_size: int = 24) -> Optional[Imag
 
 
 def _load_cjk_fonts() -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
-    """优先加载插件内置的【华康圆体 W7】（DFPYuanW7.ttf）。"""
+    """智能查找系统中可用的开源/免费 CJK 中文字体（优先文泉驿/Noto Sans，本地存在华康圆体亦可自动适配）。"""
     pkg_font = str(Path(__file__).resolve().parent / "assets" / "fonts" / "DFPYuanW7.ttf")
     
     font_candidates = [
-        pkg_font,
-        "/usr/local/share/fonts/华/华康圆体W7.ttf",
         "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf",
+        pkg_font,
+        "/usr/local/share/fonts/华/华康圆体W7.ttf",
     ]
     
     valid_font = None

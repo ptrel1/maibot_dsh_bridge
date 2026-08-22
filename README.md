@@ -92,10 +92,22 @@ max_timeout_sec = 1800.0           # 30 分钟最大保护上限
 session_match_threshold = 0.45      # 相似度阈值 (方案B)
 session_idle_expire_sec = 1800.0   # 30 分钟会话过期隔离
 
+[acp]
+dsh_bin = "dsh"                     # dsh 全局命令 (默认在系统 PATH 中查找)
+default_cwd = "."                   # 默认执行沙盒目录
+
 [post]
 gateway_url = "http://127.0.0.1:3080/api/dsh/v1"
 token = "your_gateway_token"
 ```
+
+---
+
+## 🛡️ 安全与权限规范说明
+
+- **权限模式（`DSH_PERMISSION_MODE`）**：
+  - 本插件默认支持在宿主安全策略下运行；
+  - 若配置为 `danger-full-access`（全权限开发模式），DSH 智能体可直接读写跨目录与执行系统级测试。生产环境建议通过设置管理员白名单（`admin_users`）严格限制执行权限，并仅对可信用户开放代码编写与修改指令。
 
 ---
 

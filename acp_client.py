@@ -74,12 +74,9 @@ class DshAcpClient:
                 env = dict(os.environ)
                 dsh_home_path = resolve_dsh_home()
                 env["DSH_HOME"] = dsh_home_path
-                env["DSH_PERMISSION_MODE"] = "danger-full-access"
+                env["DSH_PERMISSION_MODE"] = os.environ.get("DSH_PERMISSION_MODE", "danger-full-access")
                 env["DSH_MODEL_PROVIDER"] = self.provider
                 env["DSH_MODEL_NAME"] = self.model
-
-                if "DEEPSEEK_API_KEY" not in env or not env["DEEPSEEK_API_KEY"]:
-                    env["DEEPSEEK_API_KEY"] = "sk-4008ffef74d94c36a980393c7b856da6"
 
                 self.logger.info(
                     "Starting DSH ACP server (%s/%s, DSH_HOME=%s): node %s",

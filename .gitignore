@@ -1,3 +1,8 @@
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+data/
+config_back/
+.DS_Store
+config.toml
+assets/fonts/DFPYuanW7.ttf
