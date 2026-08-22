@@ -1,5 +1,5 @@
 [permissions]
-admin_users = ["3854532368", "1350093676", "1021143806"]
+admin_users = []
 allow_guest_users = true
 
 [persona]
@@ -9,14 +9,14 @@ mode_name = "d_teacher"
 custom_system_prompt = ""
 
 [model]
-# DSH 智能体执行大模型配置（默认使用与当前 Web 实例一致的 gemini-3.7-flash-tiered）
-provider = "maiapi2"
-model = "gemini-3.7-flash-tiered"
+# DSH 智能体执行大模型配置（默认使用 DeepSeek 官方 Flash 极速模型）
+provider = "deepseek-official"
+model = "deepseek-v4-flash"
 
 [plugin]
 enabled = true
 config_version = "0.1.0"
-mode = "post"
+mode = "acp"
 trigger_prefix = "#dsh"
 enable_natural_language = true
 block_critical_commands = true
@@ -33,4 +33,4 @@ default_cwd = "/main/app/github/deepseek-harness"
 
 [post]
 gateway_url = "http://127.0.0.1:3080/api/dsh/v1"
-token = "Qq13235202993"
+token = ""

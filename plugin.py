@@ -158,7 +158,7 @@ class PermissionsSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     admin_users: List[str] = Field(
-        default=["3854532368", "1350093676", "1021143806"],
+        default=[],
         description="管理员 QQ 号列表（拥有全功能特权，可修改代码与执行命令）",
     )
     allow_guest_users: bool = Field(
@@ -188,12 +188,12 @@ class ModelSectionConfig(PluginConfigBase):
     __ui_order__ = 2
 
     provider: str = Field(
-        default="maiapi2",
-        description="模型服务提供方路由（如 maiapi2 / deepseek-official）",
+        default="deepseek-official",
+        description="模型服务提供方路由（如 deepseek-official / maiapi2）",
     )
     model: str = Field(
-        default="gemini-3.7-flash-tiered",
-        description="执行模型名称（如 gemini-3.7-flash-tiered / deepseek-v4-flash / deepseek-v4-pro）",
+        default="deepseek-v4-flash",
+        description="执行模型名称（如 deepseek-v4-flash / deepseek-v4-pro / gemini-3.7-flash-tiered）",
     )
 
 
@@ -231,7 +231,7 @@ class PostSectionConfig(PluginConfigBase):
     __ui_order__ = 5
 
     gateway_url: str = Field(default="http://127.0.0.1:3080/api/dsh/v1", description="DSH Post Gateway API 前缀")
-    token: str = Field(default="Qq13235202993", description="网关访问 Token")
+    token: str = Field(default="", description="网关访问 Token（若无需密码鉴权可留空）")
 
 
 class DshBridgeConfig(PluginConfigBase):
@@ -565,7 +565,7 @@ class DshBridgePlugin(MaiBotPlugin):
             url = f"{cfg.post.gateway_url.rstrip('/')}/task"
             req_data = json.dumps({"prompt": final_prompt, "model": cfg.model.model, "provider": cfg.model.provider}).encode("utf-8")
             headers = {"Content-Type": "application/json"}
-            token = cfg.post.token.strip() or "Qq13235202993"
+            token = cfg.post.token.strip()
             if token:
                 headers["Authorization"] = f"Bearer {token}"
                 headers["X-Gateway-Token"] = token

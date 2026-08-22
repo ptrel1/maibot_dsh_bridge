@@ -50,7 +50,7 @@
    
    [post]
    gateway_url = "http://127.0.0.1:3080/api/dsh/v1"
-   token = "Qq13235202993"
+   token = "your_gateway_token"
    ```
 3. 在群聊或私聊中直接艾特或发送：
    ```text
@@ -70,20 +70,20 @@
 
 ```toml
 [permissions]
-admin_users = ["3854532368", "1350093676", "1021143806"] # 管理员 QQ 白名单
-allow_guest_users = true                                   # 允许普通用户只读体验
+admin_users = ["10001", "10002"]   # 管理员 QQ 白名单（拥有全功能特权，可修改代码与执行命令）
+allow_guest_users = true           # 是否允许非管理员使用只读与咨询功能
 
 [persona]
 mode_name = "d_teacher"  # d_teacher (代码专家/三步法) 或 custom (自定义模式)
 custom_system_prompt = "" # 自定义 System Prompt
 
 [model]
-provider = "maiapi2"               # 模型服务提供方路由
-model = "gemini-3.7-flash-tiered"  # 执行大模型名称
+provider = "deepseek-official"     # 模型服务提供方路由 (默认 DeepSeek 官方)
+model = "deepseek-v4-flash"        # 执行大模型名称 (默认 Flash 极速模型)
 
 [plugin]
 enabled = true
-mode = "post"                       # 运行模式: post (直连运行中DSH) 或 acp (独立子进程)
+mode = "acp"                        # 运行模式: acp (原生独立子进程) 或 post (直连运行中DSH)
 trigger_prefix = "#dsh"
 enable_natural_language = true      # 开启自然语言意图感知
 block_critical_commands = true      # 拦截 rm -rf / 等高危指令
@@ -94,7 +94,7 @@ session_idle_expire_sec = 1800.0   # 30 分钟会话过期隔离
 
 [post]
 gateway_url = "http://127.0.0.1:3080/api/dsh/v1"
-token = "Qq13235202993"
+token = "your_gateway_token"
 ```
 
 ---
