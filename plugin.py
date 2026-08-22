@@ -562,8 +562,22 @@ class DshBridgePlugin(MaiBotPlugin):
             import urllib.request
             import json
 
+            if not dsh_session:
+                dsh_session, _ = await self._resolve_smart_session(stream_id, task)
+
+            current_task = asyncio.current_task()
+            if current_task:
+                self._active_tasks[stream_id] = (dsh_session, task, time.time(), current_task)
+
             url = f"{cfg.post.gateway_url.rstrip('/')}/task"
-            req_data = json.dumps({"prompt": final_prompt, "model": cfg.model.model, "provider": cfg.model.provider}).encode("utf-8")
+            req_payload = {
+                "sessionId": dsh_session,
+                "cwd": cfg.acp.default_cwd,
+                "prompt": final_prompt,
+                "model": cfg.model.model,
+                "provider": cfg.model.provider,
+            }
+            req_data = json.dumps(req_payload).encode("utf-8")
             headers = {"Content-Type": "application/json"}
             token = cfg.post.token.strip()
             if token:
@@ -582,8 +596,11 @@ class DshBridgePlugin(MaiBotPlugin):
                 with urllib.request.urlopen(req, timeout=int(cfg.plugin.max_timeout_sec)) as resp:
                     return json.loads(resp.read().decode("utf-8"))
 
-            resp_json = await loop.run_in_executor(None, do_post)
-            return resp_json.get("output", resp_json.get("result", "(任务执行完成，暂无输出文本)"))
+            try:
+                resp_json = await loop.run_in_executor(None, do_post)
+                return resp_json.get("output", resp_json.get("result", "(任务执行完成，暂无输出文本)"))
+            finally:
+                self._active_tasks.pop(stream_id, None)
 
         return "(未知的通信模式，请检查插件配置)"
 
