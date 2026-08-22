@@ -8,6 +8,14 @@
     "name": "ptrel",
     "url": "https://github.com/ptrel1/maibot_dsh_bridge"
   },
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.png",
+      "fallback": "cpu",
+      "background": "#1f6feb"
+    }
+  },
   "license": "MIT",
   "urls": {
     "repository": "https://github.com/ptrel1/maibot_dsh_bridge"
