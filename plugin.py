@@ -675,9 +675,10 @@ class DshBridgePlugin(MaiBotPlugin):
         user_id = str(user_info.get("user_id", "")).strip()
         is_admin = self._is_admin_user(user_id)
 
-        # 0. 自然语言停止请求
+        # 0. 自然语言停止请求（泛化识别：停止、取消、别跑了、停一下、别查了、停止dsh 等）
         stop_patterns = [
-            r"^(?:停止|取消|中断|别跑了|不要跑了|停下|终止)\s*(?:dsh|任务|执行)?$",
+            r"^(?:停止|取消|中断|别跑了|不要跑了|停下|终止|别查了|别搜了|停一下|算了)\s*(?:dsh|任务|执行|查询)?$",
+            r"(?:停止|取消|中断|终止)\s*(?:dsh|deepseek|任务|执行)",
             r"^(?:dsh|deepseek[-_ ]?harness)\s*(?:stop|cancel|停止|取消)$",
             r"^#dsh\s*(?:stop|cancel|停止|取消)$",
         ]

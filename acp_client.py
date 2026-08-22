@@ -40,10 +40,10 @@ class DshAcpClient:
 
     def __init__(
         self,
-        dsh_bin: str = "node",
-        cwd: str = "/main/app/github/deepseek-harness",
-        provider: str = "maiapi2",
-        model: str = "gemini-3.7-flash-tiered",
+        dsh_bin: str = "dsh",
+        cwd: str = ".",
+        provider: str = "deepseek-official",
+        model: str = "deepseek-v4-flash",
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.dsh_bin = dsh_bin
@@ -144,11 +144,19 @@ class DshAcpClient:
         self._pending_requests.clear()
 
     async def cancel_session(self, session_id: str) -> None:
-        """Send explicit session/cancel to abort in-flight work."""
+        """根据官方 ACP 规范发送 session/cancel 通知以优雅中断当前轮次。"""
         try:
             if self._running and self._process and self._process.stdin:
-                self.logger.info("Cancelling in-flight DSH session: %s", session_id)
-                await self._send_request("session/cancel", {"sessionId": session_id})
+                self.logger.info("Cancelling in-flight DSH session (notification): %s", session_id)
+                # 官方 ACP 协议：session/cancel 是一条 JSON-RPC Notification (无 id)
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": {"sessionId": session_id}
+                }
+                line = json.dumps(payload, ensure_ascii=False) + "\n"
+                self._process.stdin.write(line.encode("utf-8"))
+                await self._process.stdin.drain()
         except Exception as e:
             self.logger.warning("Failed to cleanly cancel session %s: %s", session_id, e)
 
@@ -179,7 +187,6 @@ class DshAcpClient:
         if not self._running:
             await self.start()
 
-        # 维护一个累加列表，收集属于该 session_id 的所有流式文本
         chunks_list: List[str] = []
         self._session_listeners[session_id] = chunks_list
 
@@ -195,13 +202,12 @@ class DshAcpClient:
             try:
                 res = await asyncio.wait_for(prompt_fut, timeout=timeout)
                 stop_reason = res.get("stopReason", "end_turn")
-                self.logger.info("Session %s prompt finished with reason: %s, chunks count: %d", session_id, stop_reason, len(chunks_list))
+                self.logger.info("Session %s prompt finished with reason: %s, chunks: %d", session_id, stop_reason, len(chunks_list))
             except asyncio.TimeoutError:
                 self.logger.warning("Session %s prompt exceeded %s seconds timeout. Cancelling...", session_id, timeout)
-                asyncio.create_task(self.cancel_session(session_id))
+                await self.cancel_session(session_id)
                 raise TimeoutError(f"DSH 智能体执行超时（已超过 {int(timeout)} 秒）。已为您自动中止后台任务。")
 
-            # 等待微小窗口期确保所有流式 chunk 均已投递
             if not chunks_list:
                 await asyncio.sleep(0.2)
 
